@@ -50,7 +50,7 @@ export class Trie {
      *  - /* wildcard
      *  - character
      */
-    const tokens = markedPath.match(/(?::[^\/]+)|(?:\/\*$)|./g) || []
+    const tokens = markedPath.match(/(?::[^\/]+)|(?:\/\*$)|./gs) || []
     for (let i = groups.length - 1; i >= 0; i--) {
       const [mark] = groups[i]
       for (let j = tokens.length - 1; j >= 0; j--) {
@@ -65,7 +65,7 @@ export class Trie {
     this.paths[path] = [this.#index++, paramAssoc]
   }
 
-  buildRegExp(): [RegExp, ReplacementMap, ReplacementMap] {
+  buildRegExp(dotAll = false): [RegExp, ReplacementMap, ReplacementMap] {
     let regexp = this.#root.buildRegExpStr()
     if (regexp === '') {
       return [/^$/, [], []] // never match
@@ -88,6 +88,6 @@ export class Trie {
       return ''
     })
 
-    return [new RegExp(`^${regexp}`), indexReplacementMap, paramReplacementMap]
+    return [new RegExp(`^${regexp}`, dotAll ? 's' : ''), indexReplacementMap, paramReplacementMap]
   }
 }

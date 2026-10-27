@@ -31,7 +31,8 @@ function buildWildcardRegExp(path: string): RegExp {
             : match === '*'
               ? ONLY_WILDCARD_REG_EXP_STR
               : `/:${LABEL_REG_EXP_STR}`
-    )}$`
+    )}$`,
+    's'
   ))
 }
 
@@ -132,7 +133,8 @@ export class RegExpRouter<T> implements Router<T> {
     // SmartRouter selects one router for every method. A newly accepted branch
     // must not disable fallback for unsafe prefixes elsewhere in that router.
     const tries = Object.values(this.#tries!)
-    if (tries.some((trie) => trie.usedDisjoint)) {
+    const usedDisjoint = tries.some((trie) => trie.usedDisjoint)
+    if (usedDisjoint) {
       const unsafe = tries.find((trie) => trie.unsafePath !== undefined)
       if (unsafe) {
         throw new UnsupportedPathError(unsafe.unsafePath)
@@ -142,7 +144,7 @@ export class RegExpRouter<T> implements Router<T> {
     const matchers: MatcherMap<T> = createNullObject()
 
     for (const method of Object.keys(this.#routes!)) {
-      matchers[method] = this.#buildMatcher(method)
+      matchers[method] = this.#buildMatcher(method, usedDisjoint)
     }
 
     // Release cache
@@ -152,14 +154,16 @@ export class RegExpRouter<T> implements Router<T> {
     return matchers
   }
 
-  #buildMatcher(method: string): Matcher<T> {
+  #buildMatcher(method: string, dotAll: boolean): Matcher<T> {
     const middleware = this.#middleware![method]
     const routes = this.#routes![method]
 
     const trie = this.#tries![method]
     const staticMap: StaticMap<T> = createNullObject()
     const handlerData: HandlerData<T>[] = []
-    const [regexp, indexReplacementMap, paramReplacementMap] = trie.buildRegExp()
+    // Newly accepted tables have passed the closed-pattern safety check, so
+    // dotAll only broadens internal wildcards to include decoded line terminators.
+    const [regexp, indexReplacementMap, paramReplacementMap] = trie.buildRegExp(dotAll)
 
     for (const r of [middleware, routes]) {
       for (const path in r) {
