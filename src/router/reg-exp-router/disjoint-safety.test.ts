@@ -44,6 +44,12 @@ const unprovenPaths = [
   ['/odd@0/x/:id{[0-9]+}', '/odd@0/x/42'],
   ['/odd{2}/x/:id{[0-9]+}', '/odd{2}/x/42'],
 ]
+const repeatedParameters = [
+  [':x{[0-9]+}', '12'],
+  [':x', 'a'],
+  [':x{a}', 'a'],
+  [':x{[a-z]+}', 'ab'],
+]
 
 function normalize(result: Result<string>) {
   return result[0].map(([handler, params]) => [
@@ -103,6 +109,34 @@ describe.each(builders)('%s disjoint branch safety', (_name, build) => {
     expect(router.match('GET', '/letters/abc')[0]).toEqual([])
   })
 
+  it.each(repeatedParameters)(
+    'rejects repeated parameter names after %s in a newly accepted table',
+    (firstParameter, firstValue) => {
+      const path = `/a/${firstParameter}/:x{[0-9]+}`
+      for (const method of ['GET', 'POST']) {
+        const route: Route = [method, path, 'repeated']
+        for (const ordered of [
+          [route, ...disjoint],
+          [...disjoint, route],
+        ]) {
+          expect(() => build(ordered).match(method, `/a/${firstValue}/42`)).toThrowError(
+            new UnsupportedPathError(path)
+          )
+        }
+      }
+    }
+  )
+
+  it.each(repeatedParameters)(
+    'preserves previously supported repeated names after %s without disjoint branches',
+    (firstParameter, firstValue) => {
+      const router = build([['GET', `/a/${firstParameter}/:x{[0-9]+}`, 'repeated']])
+      expect(normalize(router.match('GET', `/a/${firstValue}/42`))).toEqual([
+        ['repeated', { x: firstValue }],
+      ])
+    }
+  )
+
   it.each([':prefix', ':prefix{a}', ':prefix{[a-z]+}', ':prefix{\\d+}'])(
     'allows disjoint children below a non-slash ancestor %s',
     (prefix) => {
@@ -157,6 +191,28 @@ describe.each(builders)('%s disjoint branch safety', (_name, build) => {
 })
 
 describe('Hono with disjoint branches', () => {
+  it.each(repeatedParameters)(
+    'preserves the last value of repeated names after %s through fallback',
+    async (firstParameter, firstValue) => {
+      for (const method of ['GET', 'POST']) {
+        const route: Route = [method, `/a/${firstParameter}/:x{[0-9]+}`, 'repeated']
+        for (const ordered of [
+          [route, ...disjoint],
+          [...disjoint, route],
+        ]) {
+          const app = new Hono()
+          for (const [method, path, handler] of ordered) {
+            app.on(method, path, (c) => c.json({ handler, params: c.req.param() }))
+          }
+          const response = await app.request(`/a/${firstValue}/42`, { method })
+          expect(response.status).toBe(200)
+          expect(await response.json()).toEqual({ handler: 'repeated', params: { x: '42' } })
+          expect(app.router.name).toBe('SmartRouter + TrieRouter')
+        }
+      }
+    }
+  )
+
   it('retains upstream access denial on equivalent literal prefixes', async () => {
     const app = new Hono()
     app.use('/g/:prefix{a}/*', async (c) => c.text('blocked', 403))

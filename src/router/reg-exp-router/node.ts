@@ -187,6 +187,11 @@ export class Node {
           nextNode = node.#children[regexpStr] = new Node()
         }
         if (name !== '') {
+          if (paramMap.some(([key]) => key === name)) {
+            // RegExpRouter and TrieRouter resolve repeated names differently.
+            // Preserve fallback when the new sibling proof is used.
+            context.unsafePath ??= context.path
+          }
           nextNode.#varIndex ??= context.varIndex++
           paramMap.push([name, nextNode.#varIndex])
         }
