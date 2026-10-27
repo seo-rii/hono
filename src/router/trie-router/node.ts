@@ -35,9 +35,7 @@ export class Node<T> {
     let i = 0
     for (const p of parts) {
       const nextP = parts[++i]
-      const pattern =
-        getPattern(p, nextP) ||
-        (nextP === undefined && p && p.indexOf('*') === p.length - 1 ? p : null)
+      const pattern = getPattern(p, nextP) || (p && p.indexOf('*') === p.length - 1 ? p : null)
       const isParam = Array.isArray(pattern)
       const key = isParam ? pattern[0] : pattern || p
 
@@ -105,10 +103,12 @@ export class Node<T> {
         const node = curNodes[j]
         const nextNode = node.#children[part]
 
-        if (nextNode) {
+        // Pattern nodes are also stored in `#children`; leave them to the pattern loop
+        // below even when the request segment is literally their key.
+        if (nextNode && nextNode.#pattern === undefined) {
           nextNode.#params = node.#params
           if (isLast) {
-            // '/hello/*' => match '/hello'
+            // '/hello/*' => match '/hello'.
             if (nextNode.#children['*']) {
               this.#pushHandlerSets(handlerSets, nextNode.#children['*'], method, node.#params)
             }
@@ -127,7 +127,13 @@ export class Node<T> {
           if (typeof pattern === 'string') {
             if (pattern === '*' || part.startsWith(pattern.slice(0, -1))) {
               this.#pushHandlerSets(handlerSets, child, method, node.#params)
-              if (pattern === '*') {
+              // A standalone `*` consumes at least one character before another segment
+              // can follow it; one with a prefix may consume none.
+              if (pattern !== '*' || part !== '') {
+                // '/x*/*' => match '/x', '/a/*/*' => match '/a/b'
+                if (isLast && child.#children['*']) {
+                  this.#pushHandlerSets(handlerSets, child.#children['*'], method, node.#params)
+                }
                 child.#params = params
                 tempNodes.push(child)
               }
@@ -155,9 +161,7 @@ export class Node<T> {
 
             const m = matcher.exec(restPathString)
             if (m) {
-              if (!Object.hasOwn(params, name)) {
-                params[name] = m[0]
-              }
+              params[name] = m[0]
               this.#pushHandlerSets(handlerSets, child, method, node.#params, params)
 
               // '/:id{[0-9]+}/*' => match '/123'
@@ -184,9 +188,7 @@ export class Node<T> {
           }
 
           if (matcher === true || matcher.test(part)) {
-            if (!Object.hasOwn(params, name)) {
-              params[name] = part
-            }
+            params[name] = part
             if (isLast) {
               this.#pushHandlerSets(handlerSets, child, method, params, node.#params)
               if (child.#children['*']) {

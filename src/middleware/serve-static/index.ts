@@ -5,7 +5,6 @@
 
 import type { Context, Data } from '../../context'
 import type { Env, MiddlewareHandler } from '../../types'
-import { parseAccept } from '../../utils/accept'
 import { COMPRESSIBLE_CONTENT_TYPE_REGEX } from '../../utils/compress'
 import { getMimeType } from '../../utils/mime'
 import { tryDecodeURI } from '../../utils/url'
@@ -43,10 +42,6 @@ export const serveStatic = <E extends Env = Env>(
      * `join` option according to the runtime. Example `import { join } from 'node:path`. If not specified, it will fall back to the default join function.`
      */
     join?: (...paths: string[]) => string
-    /**
-     * @deprecated Currently, `pathResolve` is no longer used.
-     */
-    pathResolve?: (path: string) => string
     isDir?: (path: string) => boolean | undefined | Promise<boolean | undefined>
   }
 ): MiddlewareHandler => {
@@ -105,9 +100,10 @@ export const serveStatic = <E extends Env = Env>(
 
       if (options.precompressed && (!mimeType || COMPRESSIBLE_CONTENT_TYPE_REGEX.test(mimeType))) {
         const acceptEncodingSet = new Set(
-          parseAccept(c.req.header('Accept-Encoding') ?? '')
-            .filter((encoding) => encoding.q > 0)
-            .map((encoding) => encoding.type)
+          c.req
+            .header('Accept-Encoding')
+            ?.split(',')
+            .map((encoding) => encoding.trim())
         )
 
         for (const encoding of ENCODINGS_ORDERED_KEYS) {

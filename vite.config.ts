@@ -4,14 +4,6 @@ import { defineConfig } from 'vite-plus'
 import type { TsdownPluginOption } from 'vite-plus/pack'
 import { appendExportEmptyToDts, keepBarrelImportsInDts } from './build/dts-plugins'
 
-const entry = ['src/**/*.ts', '!src/**/*.test.ts', '!src/**/*.test.tsx']
-const common = {
-  entry,
-  tsconfig: 'tsconfig.build.json',
-  unbundle: true,
-  clean: false,
-}
-
 const removeDtsPrivateFieldsPlugin: TsdownPluginOption = {
   name: 'hono:remove-dts-private-fields',
   async renderChunk(code, id) {
@@ -32,6 +24,33 @@ const removeDtsPrivateFieldsPlugin: TsdownPluginOption = {
         })
       },
     }).visit(ast.program)
+
+    return ms.toString()
+  },
+}
+
+// JSDoc is kept in the .d.ts files, which editors read. Dropping it from the .js files makes the package smaller.
+const removeJsDocPlugin: TsdownPluginOption = {
+  name: 'hono:remove-jsdoc',
+  async renderChunk(code, id) {
+    if (!id.fileName.endsWith('.js')) {
+      return
+    }
+
+    const { comments } = await parse(id.fileName, code)
+    const ms = new RolldownMagicString(code, { filename: id.fileName })
+
+    for (const comment of comments) {
+      if (comment.type !== 'Block' || !comment.value.startsWith('*')) {
+        continue
+      }
+      // Also remove the whitespace up to the next token, so no blank line is left behind
+      let end = comment.end
+      while (end < code.length && /\s/.test(code[end])) {
+        end++
+      }
+      ms.remove(comment.start, end)
+    }
 
     return ms.toString()
   },
@@ -336,30 +355,19 @@ export default defineConfig({
       },
     ],
   },
-  pack: [
-    {
-      ...common,
-      format: ['esm'],
-      outDir: 'dist',
-      dts: false,
-      outExtensions: () => ({ js: '.js' }),
-      plugins: [validatePackageExportsPlugin],
-    },
-    {
-      ...common,
-      format: ['cjs'],
-      outDir: 'dist/cjs',
-      dts: false,
-      outExtensions: () => ({ js: '.js' }),
-      // No need to validate package exports for CJS build, as it is already validated in ESM build.
-    },
-    {
-      ...common,
-      format: ['esm'],
-      outDir: 'dist/types',
-      dts: { emitDtsOnly: true },
-      plugins: [removeDtsPrivateFieldsPlugin, keepBarrelImportsInDts, appendExportEmptyToDts],
-      outExtensions: () => ({ dts: '.d.ts' }),
-    },
-  ],
+  pack: {
+    entry: ['src/**/*.ts', '!src/**/*.test.ts', '!src/**/*.test.tsx'],
+    tsconfig: 'tsconfig.build.json',
+    unbundle: true,
+    format: ['esm'],
+    dts: true,
+    outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
+    plugins: [
+      validatePackageExportsPlugin,
+      removeJsDocPlugin,
+      removeDtsPrivateFieldsPlugin,
+      keepBarrelImportsInDts,
+      appendExportEmptyToDts,
+    ],
+  },
 })

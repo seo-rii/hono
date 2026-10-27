@@ -1,8 +1,10 @@
 import { createNullObject } from '../utils'
 
 export const LABEL_REG_EXP_STR = '[^/]+'
-export const ONLY_WILDCARD_REG_EXP_STR = '.*'
-export const TAIL_WILDCARD_REG_EXP_STR = '(?:|/.*)'
+// Match line terminators without changing the flags of user-defined parameter patterns.
+export const ONLY_WILDCARD_REG_EXP_STR = '[^]*'
+export const PREFIXED_WILDCARD_REG_EXP_STR = '[^/]*'
+export const TAIL_WILDCARD_REG_EXP_STR = '(?:|/[^]*)'
 export const PATH_ERROR = Symbol()
 
 export type ParamAssocArray = [string, number][]
@@ -15,12 +17,9 @@ export interface Context {
 
 const regExpMetaChars = new Set('.\\+*[^]$()')
 
-// Recognize whole, non-empty atoms only. Looking at a regexp prefix would be
-// unsound for alternatives, nullable expressions, or assertions. Unknown
-// expressions keep the existing UnsupportedPathError behavior.
+// Prove disjointness only for whole, nonempty atoms. Unknown expressions keep
+// their existing fallback behavior rather than relying on a regexp prefix.
 function firstCharacterRanges(pattern: string): [number, number][] | undefined {
-  // Node keys do not distinguish literal chars from one-char custom patterns.
-  // Keep operators such as `|` out of this proof, even on a literal branch.
   if (pattern.length === 1 && /^[A-Za-z0-9_/-]$/.test(pattern)) {
     const code = pattern.charCodeAt(0)
     return [[code, code]]
@@ -84,9 +83,9 @@ function compareKey(a: string, b: string): number {
     return 1
   }
 
-  // wildcard: the only wildcard (.*) precedes the tail wildcard
+  // wildcard: the tail wildcard precedes the only wildcard, which matches a superset of it
   if (a === ONLY_WILDCARD_REG_EXP_STR || a === TAIL_WILDCARD_REG_EXP_STR) {
-    return b === TAIL_WILDCARD_REG_EXP_STR ? -1 : 1
+    return b === ONLY_WILDCARD_REG_EXP_STR ? -1 : 1
   } else if (b === ONLY_WILDCARD_REG_EXP_STR || b === TAIL_WILDCARD_REG_EXP_STR) {
     return -1
   }
@@ -105,7 +104,6 @@ export class Node {
   // handler index of a dynamic path, or -1 for a static path terminal
   #index?: number
   #varIndex?: number
-  #hasLiteral?: boolean
   #children: Record<string, Node> = createNullObject()
 
   insert(
@@ -113,7 +111,7 @@ export class Node {
     index: number,
     paramMap: ParamAssocArray,
     context: Context,
-    isStatic: boolean
+    keys: string[]
   ): void {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     let node: Node = this
@@ -124,22 +122,23 @@ export class Node {
           ? token === '*'
             ? i === len - 1
               ? ['', '', ONLY_WILDCARD_REG_EXP_STR] // '*' matches to all the trailing paths
-              : ['', '', LABEL_REG_EXP_STR]
+              : tokens[i + 1][0] !== '/'
+                ? null // only a '*' that ends a segment is a wildcard
+                : tokens[i - 1] === '/'
+                  ? ['', '', LABEL_REG_EXP_STR] // a standalone '*' takes a whole segment
+                  : ['', '', PREFIXED_WILDCARD_REG_EXP_STR] // 'x*' may take nothing
             : null
           : token === '/*'
-            ? ['', '', TAIL_WILDCARD_REG_EXP_STR] // '/path/to/*' is /\/path\/to(?:|/.*)$
+            ? ['', '', TAIL_WILDCARD_REG_EXP_STR] // '/path/to/*' also matches '/path/to'
             : token.match(/^\:([^\{\}]+)(?:\{(.+)\})?$/)
 
       let nextNode: Node
       if (pattern) {
-        if (token === '*' && i < len - 1) {
-          // Middle wildcards have different empty-segment semantics in TrieRouter.
-          context.unsafePath ??= context.path
-        }
         const name = pattern[1]
         let regexpStr = pattern[2] || LABEL_REG_EXP_STR
         if (name && pattern[2]) {
-          if (regexpStr === '.*') {
+          if (new RegExp(regexpStr).test('')) {
+            // an empty capture is indistinguishable from the handler marker `$()` at match time
             throw PATH_ERROR
           }
           regexpStr = regexpStr.replace(/^\((?!\?:)(?=[^)]+\)$)/, '(?:') // (a|b) => (?:a|b)
@@ -154,23 +153,29 @@ export class Node {
           if (regexpStr !== LABEL_REG_EXP_STR) {
             const ranges = firstCharacterRanges(regexpStr)
             if (!ranges || ranges.some(([start, end]) => start <= 47 && 47 <= end)) {
-              // Keep newly accepted tables within the proven nonempty segment grammar.
-              // Slash-consuming prefixes can backtrack into another branch, and empty
-              // terminal captures can be mistaken for the handler marker.
+              // New sibling branches need unambiguous segment boundaries. A
+              // slash-consuming ancestor can backtrack into another branch.
               context.unsafePath ??= context.path
             }
           }
         }
 
+        keys.push(regexpStr)
         nextNode = node.#children[regexpStr]
         if (!nextNode) {
-          if (regexpStr !== ONLY_WILDCARD_REG_EXP_STR && regexpStr !== TAIL_WILDCARD_REG_EXP_STR) {
+          if (
+            regexpStr !== ONLY_WILDCARD_REG_EXP_STR &&
+            (regexpStr !== TAIL_WILDCARD_REG_EXP_STR ||
+              node.#children[PREFIXED_WILDCARD_REG_EXP_STR])
+          ) {
             for (const k in node.#children) {
               if (
                 // a single-char pattern coexists with single-char literals as a literal does
                 (regexpStr.length > 1 || k.length > 1) &&
                 k !== ONLY_WILDCARD_REG_EXP_STR &&
-                k !== TAIL_WILDCARD_REG_EXP_STR
+                // a prefixed wildcard only partially overlaps a tail wildcard, so the two
+                // cannot be represented together
+                (k !== TAIL_WILDCARD_REG_EXP_STR || regexpStr === PREFIXED_WILDCARD_REG_EXP_STR)
               ) {
                 if (!areDisjoint(regexpStr, k)) {
                   throw PATH_ERROR
@@ -182,15 +187,11 @@ export class Node {
           nextNode = node.#children[regexpStr] = new Node()
         }
         if (name !== '') {
-          if (nextNode.#hasLiteral) {
-            // Middleware propagation compares route spellings, so a parameter
-            // and an equivalent literal cannot safely share a new disjoint table.
-            context.unsafePath ??= context.path
-          }
           nextNode.#varIndex ??= context.varIndex++
           paramMap.push([name, nextNode.#varIndex])
         }
       } else {
+        keys.push(token)
         nextNode = node.#children[token]
         if (!nextNode) {
           for (const k in node.#children) {
@@ -207,12 +208,11 @@ export class Node {
           }
           nextNode = node.#children[token] = new Node()
         }
-        if (nextNode.#varIndex !== undefined || token.length !== 1 || '{}|?@#'.includes(token)) {
-          // These literal characters are not escaped by the regexp emitter, or
-          // are reserved by its capture-marker replacement pass.
+        if (token.length !== 1 || '{}|?@#'.includes(token)) {
+          // Do not expose existing emitter/marker ambiguities by accepting an
+          // otherwise unsupported table solely through the new sibling proof.
           context.unsafePath ??= context.path
         }
-        nextNode.#hasLiteral = true
       }
 
       node = nextNode
@@ -221,7 +221,7 @@ export class Node {
     if (node.#index !== undefined) {
       throw PATH_ERROR
     }
-    node.#index = isStatic ? -1 : index
+    node.#index = index
   }
 
   buildRegExpStr(): string {

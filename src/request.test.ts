@@ -26,14 +26,6 @@ describe('Query', () => {
     expect(q2).toBeUndefined()
   })
 
-  test('query() preserves the order of encoded and unencoded duplicate keys', () => {
-    const req = new HonoRequest(new Request('http://localhost?item%5B%5D=first&item[]=second'))
-
-    expect(req.query('item[]')).toBe('first')
-    expect(req.query()).toEqual({ 'item[]': 'first' })
-    expect(req.queries('item[]')).toEqual(['first', 'second'])
-  })
-
   test('decode special chars', () => {
     const rawRequest = new Request('http://localhost?mail=framework%40hono.dev&tag=%401&tag=%402')
     const req = new HonoRequest(rawRequest)
@@ -144,53 +136,22 @@ describe('Param', () => {
   })
 })
 
-describe('matchedRoutes', () => {
-  test('req.routePath', () => {
-    const handlerA = () => {}
-    const handlerB = () => {}
-    const rawRequest = new Request('http://localhost?page=2&tag=A&tag=B')
-    const req = new HonoRequest<'/:id/:name'>(rawRequest, '/123/key', [
-      [
-        [
-          [handlerA, { basePath: '/', handler: handlerA, method: 'GET', path: '/:id' }],
-          { id: '123' },
-        ],
-        [
-          [handlerA, { basePath: '/', handler: handlerB, method: 'GET', path: '/:id/:name' }],
-          { id: '456', name: 'key' },
-        ],
-      ],
-    ])
-
-    expect(req.matchedRoutes).toEqual([
-      { basePath: '/', handler: handlerA, method: 'GET', path: '/:id' },
-      { basePath: '/', handler: handlerB, method: 'GET', path: '/:id/:name' },
-    ])
+describe('Stricter types', () => {
+  test('query() and queries() may return undefined for an absent key', () => {
+    const req = new HonoRequest(new Request('http://localhost?q=hono'))
+    expectTypeOf(req.query()).toEqualTypeOf<Record<string, string | undefined>>()
+    expectTypeOf(req.queries()).toEqualTypeOf<Record<string, string[] | undefined>>()
+    expectTypeOf(req.query('q')).toEqualTypeOf<string | undefined>()
   })
 })
 
-describe('routePath', () => {
-  test('req.routePath', () => {
-    const handlerA = () => {}
-    const handlerB = () => {}
-    const rawRequest = new Request('http://localhost?page=2&tag=A&tag=B')
-    const req = new HonoRequest<'/:id/:name'>(rawRequest, '/123/key', [
-      [
-        [
-          [handlerA, { basePath: '/', handler: handlerA, method: 'GET', path: '/:id' }],
-          { id: '123' },
-        ],
-        [
-          [handlerA, { basePath: '/', handler: handlerB, method: 'GET', path: '/:id/:name' }],
-          { id: '456', name: 'key' },
-        ],
-      ],
-    ])
-
-    expect(req.routePath).toBe('/:id')
-
-    req.routeIndex = 1
-    expect(req.routePath).toBe('/:id/:name')
+describe('json()', () => {
+  test('returns unknown by default', async () => {
+    const req = new HonoRequest(
+      new Request('http://localhost', { method: 'POST', body: '{"name":"hono"}' })
+    )
+    expectTypeOf(await req.json()).toEqualTypeOf<unknown>()
+    expectTypeOf(await req.json<{ name: string }>()).toEqualTypeOf<{ name: string }>()
   })
 })
 

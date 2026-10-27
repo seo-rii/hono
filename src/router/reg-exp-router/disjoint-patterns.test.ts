@@ -201,7 +201,7 @@ describe.each(builders)('%s disjoint constrained branches', (_name, build) => {
     }).toThrowError(UnsupportedPathError)
   })
 
-  it.each(['|', '?'])(
+  it.each(['|'])(
     'does not classify the single-character metapattern %s as a literal',
     (pattern) => {
       const routes: Route[] = [

@@ -8,8 +8,8 @@ export class Trie {
   #context: Context = { varIndex: 0, path: '' }
   #root: Node = new Node()
   #index: number = 0
-  // dynamic path -> [handler index, param assoc]; static paths are not registered
-  paths: Record<string, [number, ParamAssocArray]> = createNullObject()
+  // path -> [handler index (-1 for a static path), param assoc, node keys along the branch]
+  paths: Record<string, [number, ParamAssocArray, string[]]> = createNullObject()
 
   get usedDisjoint(): boolean {
     return this.#context.usedDisjoint ?? false
@@ -21,9 +21,11 @@ export class Trie {
 
   insert(path: string, isStatic: boolean): void {
     this.#context.path = path
+    const keys: string[] = []
     if (isStatic) {
       // a static path has no pattern; every character is a literal token
-      this.#root.insert(path.split(''), 0, [], this.#context, true)
+      this.#root.insert(path.split(''), -1, [], this.#context, keys)
+      this.paths[path] = [-1, [], keys]
       return
     }
 
@@ -33,7 +35,7 @@ export class Trie {
     let markedPath = path
     for (let i = 0; ;) {
       let replaced = false
-      markedPath = markedPath.replace(/\{[^}]+\}/g, (m) => {
+      markedPath = markedPath.replace(/\{(?:\{[\d,]+\}|[^}])+\}/g, (m) => {
         const mark = `@\\${i}`
         groups[i] = [mark, m]
         i++
@@ -61,11 +63,11 @@ export class Trie {
       }
     }
 
-    this.#root.insert(tokens, this.#index, paramAssoc, this.#context, false)
-    this.paths[path] = [this.#index++, paramAssoc]
+    this.#root.insert(tokens, this.#index, paramAssoc, this.#context, keys)
+    this.paths[path] = [this.#index++, paramAssoc, keys]
   }
 
-  buildRegExp(dotAll = false): [RegExp, ReplacementMap, ReplacementMap] {
+  buildRegExp(): [RegExp, ReplacementMap, ReplacementMap] {
     let regexp = this.#root.buildRegExpStr()
     if (regexp === '') {
       return [/^$/, [], []] // never match
@@ -88,6 +90,6 @@ export class Trie {
       return ''
     })
 
-    return [new RegExp(`^${regexp}`, dotAll ? 's' : ''), indexReplacementMap, paramReplacementMap]
+    return [new RegExp(`^${regexp}`), indexReplacementMap, paramReplacementMap]
   }
 }

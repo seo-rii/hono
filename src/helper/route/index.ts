@@ -125,10 +125,7 @@ export const basePath = (c: Context, index?: number): string => {
       const pattern = getPattern(paths[i], paths[i + 1])
       if (pattern) {
         const re = pattern[2] === true || pattern === '*' ? /[^\/]+/ : pattern[2]
-        const restPath = reqPath.substring(basePathLength + 1)
-        // like the router, fall back to matching only the current segment
-        const segment = restPath.split('/', 1)[0]
-        basePathLength += (restPath.match(re)?.[0] ?? (re.test(segment) ? segment : '')).length
+        basePathLength += reqPath.substring(basePathLength + 1).match(re)?.[0].length || 0
       } else {
         basePathLength += paths[i].length
       }

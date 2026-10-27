@@ -3,20 +3,36 @@
 import { expectTypeOf } from 'vitest'
 import { hc } from './client'
 import type { Context, ExecutionContext } from './context'
+import { routePath } from './helper/route'
 import { Hono } from './hono'
 import { HTTPException } from './http-exception'
 import { logger } from './middleware/logger'
 import { poweredBy } from './middleware/powered-by'
+import type { Result, Router } from './router'
+import { LinearRouter } from './router/linear-router'
 import { RegExpRouter } from './router/reg-exp-router'
 import { SmartRouter } from './router/smart-router'
 import { TrieRouter } from './router/trie-router'
-import type { Handler, MiddlewareHandler, Next } from './types'
+import type { ErrorHandler, H, Handler, MiddlewareHandler, Next, RouterRoute } from './types'
 import type { Equal, Expect } from './utils/types'
 import { getPath } from './utils/url'
+
+const METHOD_NAME_NOT_FOUND = '@NOT_FOUND'
+const METHOD_NAME_ERROR = '@ERROR'
 
 // https://stackoverflow.com/a/65666402
 function throwExpression(errorMessage: string): never {
   throw new Error(errorMessage)
+}
+
+const createApp = (withUpstreamMiddleware: boolean) => {
+  const app = new Hono()
+  if (withUpstreamMiddleware) {
+    app.use(async (_c, next) => {
+      await next()
+    })
+  }
+  return app
 }
 
 type Env = {
@@ -362,7 +378,6 @@ describe('Options', () => {
     describe('strict is false with `getPath` option', () => {
       const app = new Hono({
         strict: false,
-        // @ts-expect-error `getPath` is not used when `strict` is false
         getPath: getPath,
       })
 
@@ -509,6 +524,7 @@ describe('Routing', () => {
       expect(app.routes).toEqual([
         {
           basePath: '/:sub',
+          depth: 1,
           method: 'GET',
           path: '/:sub/posts/:id',
           handler: expect.any(Function),
@@ -527,6 +543,7 @@ describe('Routing', () => {
       expect(app.routes).toEqual([
         {
           basePath: '/:sub1/:sub2',
+          depth: 2,
           method: 'GET',
           path: '/:sub1/:sub2/posts/:id',
           handler: expect.any(Function),
@@ -543,6 +560,7 @@ describe('Routing', () => {
       expect(app.routes).toEqual([
         {
           basePath: '/api/book',
+          depth: 1,
           method: 'GET',
           path: '/api/book/:id',
           handler: expect.any(Function),
@@ -917,7 +935,7 @@ describe('param and query', () => {
 
     app.get('/multiple-values', (c) => {
       const { q, limit } = c.req.queries()
-      return c.text(`q is ${q[0]} and ${q[1]}, limit is ${limit[0]}`)
+      return c.text(`q is ${q?.[0]} and ${q?.[1]}, limit is ${limit?.[0]}`)
     })
 
     app.get('/add-header', (c) => {
@@ -1436,13 +1454,16 @@ describe('Error handle', () => {
       throw new Error('This is Middleware Error')
     })
 
-    app.onError((err, c) => {
-      c.header('x-debug', err.message)
+    app.onError((c) => {
+      c.header('x-debug', c.error!.message)
       return c.text('Custom Error Message', 500)
     })
 
-    it('Should throw Error if a non-Error object is thrown in a handler', async () => {
-      expect(() => app.request('/error-string')).toThrowError()
+    it('Should handle a non-Error value thrown in a handler', async () => {
+      const res = await app.request('/error-string')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Custom Error Message')
+      expect(res.headers.get('x-debug')).toBe('This is Error')
     })
 
     it('Custom Error Message', async () => {
@@ -1458,6 +1479,123 @@ describe('Error handle', () => {
     })
   })
 
+  it.each(['sync', 'async'])(
+    'Should pass a non-Error value thrown from a %s handler to onError as an Error cause',
+    async (mode) => {
+      const app = new Hono()
+      const handler = () => {
+        throw null
+      }
+      app.get('/', mode === 'async' ? async () => handler() : handler)
+      const onError = vi.fn(async (c: Context) => c.text('Custom Error Message', 500))
+      app.onError(onError)
+
+      const res = await app.request('/')
+
+      expect(onError).toHaveBeenCalledOnce()
+      const [context] = onError.mock.calls[0]
+      const error = context.error!
+      expect(error).toBeInstanceOf(Error)
+      expect(error.cause).toBe(null)
+      expect(error.message).toBe('')
+      expect(context.error).toBe(error)
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Custom Error Message')
+    }
+  )
+
+  it('Should return a default 500 response for a non-Error throw', async () => {
+    const app = new Hono()
+    app.get('/', () => {
+      throw { message: 'Unexpected error' }
+    })
+
+    const res = await app.request('/')
+
+    expect(res.status).toBe(500)
+    expect(await res.text()).toBe('Internal Server Error')
+  })
+
+  it('Should resume middleware after a non-Error throw', async () => {
+    const app = new Hono()
+    app.use(async (c, next) => {
+      await next()
+      c.header('x-after-next', 'executed')
+    })
+    app.get('/', () => {
+      throw { message: 'Unexpected error' }
+    })
+
+    const res = await app.request('/')
+
+    expect(res.status).toBe(500)
+    expect(await res.text()).toBe('Internal Server Error')
+    expect(res.headers.get('x-after-next')).toBe('executed')
+  })
+
+  it('Should use the sub-app onError for a non-Error throw', async () => {
+    const app = new Hono()
+    const sub = new Hono()
+    const value = { message: 'Sub-app error' }
+    const onError = vi.fn((c: Context) => c.text('Parent error', 500))
+    const subOnError = vi.fn((c: Context) => c.text('Sub-app error', 500))
+    app.onError(onError)
+    app.use(async (c, next) => {
+      await next()
+      c.header('x-after-next', 'executed')
+    })
+    sub.onError(subOnError)
+    sub.get('/', async () => {
+      throw value
+    })
+    app.route('/sub', sub)
+
+    const res = await app.request('/sub')
+
+    expect(onError).not.toHaveBeenCalled()
+    expect(subOnError).toHaveBeenCalledOnce()
+    const [context] = subOnError.mock.calls[0]
+    const error = context.error!
+    expect(error).toBeInstanceOf(Error)
+    expect(error.cause).toBe(value)
+    expect(context.error).toBe(error)
+    expect(res.status).toBe(500)
+    expect(await res.text()).toBe('Sub-app error')
+    expect(res.headers.get('x-after-next')).toBe('executed')
+  })
+
+  it('Should handle a non-Error throw from notFound', async () => {
+    const app = new Hono()
+    app.use(async () => {})
+    app.notFound(() => {
+      throw 'Not Found error'
+    })
+    app.onError((c) => c.text(c.error!.message, 500))
+
+    const res = await app.request('/')
+
+    expect(res.status).toBe(500)
+    expect(await res.text()).toBe('Not Found error')
+  })
+
+  it('Should set c.error when notFound throws with no matched route', async () => {
+    const app = new Hono()
+    const error = new Error('This is Error')
+    app.notFound(() => {
+      throw error
+    })
+    let errorInContext: Error | undefined
+    app.onError((c) => {
+      errorInContext = c.error
+      return c.text('Custom Error Message', 500)
+    })
+
+    const res = await app.request('/')
+
+    expect(res.status).toBe(500)
+    expect(errorInContext).toBe(error)
+  })
+
   describe('Async custom handler', () => {
     const app = new Hono()
 
@@ -1469,14 +1607,14 @@ describe('Error handle', () => {
       throw new Error('This is Middleware Error')
     })
 
-    app.onError(async (err, c) => {
+    app.onError(async (c) => {
       const promise = new Promise((resolve) =>
         setTimeout(() => {
           resolve('Promised')
         }, 1)
       )
       const message = (await promise) as string
-      c.header('x-debug', err.message)
+      c.header('x-debug', c.error!.message)
       return c.text(`Custom Error Message with ${message}`, 500)
     })
 
@@ -1514,8 +1652,8 @@ describe('Error handle', () => {
       throw new HTTPException(401)
     })
 
-    app2.onError((err, c) => {
-      if (err instanceof HTTPException && err.status === 401) {
+    app2.onError((c) => {
+      if (c.error instanceof HTTPException && c.error.status === 401) {
         return c.text('Custom Error Message', 401)
       }
       return c.text('Internal Server Error', 500)
@@ -1643,8 +1781,8 @@ describe('Error handling in middleware', () => {
       throw new Error('Error in Not Found')
     })
 
-    app.onError((err, c) => {
-      return c.text(err.message, 400)
+    app.onError((c) => {
+      return c.text(c.error!.message, 400)
     })
 
     it('Should handle the error thrown in `notFound()``', async () => {
@@ -1897,7 +2035,7 @@ describe('Hono with `app.route`', () => {
       }
     })
 
-    app.onError((err, c) => {
+    app.onError((c) => {
       return c.text('onError by app', 500)
     })
 
@@ -1914,7 +2052,7 @@ describe('Hono with `app.route`', () => {
       throw new Error('This is Error')
     })
 
-    sub.onError((err, c) => {
+    sub.onError((c) => {
       return c.text('onError by sub', 500)
     })
 
@@ -1927,8 +2065,14 @@ describe('Hono with `app.route`', () => {
       expect(await res.text()).toBe('post: 123')
     })
 
-    it('should be handled by app', async () => {
+    it('should use the path-matched sub-app even for errors from parent middleware', async () => {
       const res = await app.request('https://example.com/sub/ok?app-error=1')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('onError by sub')
+    })
+
+    it('should use the parent handler outside the sub-app path', async () => {
+      const res = await app.request('/other?app-error=1')
       expect(res.status).toBe(500)
       expect(await res.text()).toBe('onError by app')
     })
@@ -1950,7 +2094,7 @@ describe('Hono with `app.route`', () => {
       throw new Error('This is Error')
     })
 
-    sub.onError((err, c) => {
+    sub.onError((c) => {
       return c.text('onError by sub', 500)
     })
 
@@ -1968,6 +2112,482 @@ describe('Hono with `app.route`', () => {
     })
   })
 
+  describe('onError middleware', () => {
+    it.each([RegExpRouter, TrieRouter])(
+      'Should compose scoped middleware and a global fallback independently of the HTTP method with %s',
+      async (Router) => {
+        const app = new Hono({ router: new Router() })
+        const setLanguage: MiddlewareHandler<{ Variables: { language: string } }> = async (
+          c,
+          next
+        ) => {
+          c.set('language', 'en')
+          await next()
+          c.header('x-language', c.var.language)
+        }
+
+        app.all('*', () => {
+          throw new Error('failed')
+        })
+        app.onError('/items/*', setLanguage, (c) =>
+          c.text(`${c.var.language}: ${c.error!.message}`, 500)
+        )
+        app.onError('*', (c) => c.text('Fallback', 500))
+
+        for (const method of ['GET', 'POST', 'DELETE']) {
+          const res = await app.request('/items/1', { method })
+          expect(res.status).toBe(500)
+          expect(await res.text()).toBe('en: failed')
+          expect(res.headers.get('x-language')).toBe('en')
+        }
+        const res = await app.request('/other')
+        expect(await res.text()).toBe('Fallback')
+        expect(res.headers.get('x-language')).toBeNull()
+      }
+    )
+
+    it('Should scope pathless registrations to basePath without wrapping normal handlers', async () => {
+      const app = new Hono()
+      const api = new Hono().basePath('/api')
+      const handler: Handler = (c) => c.text('OK')
+
+      api.onError((c) => c.text(`API: ${c.error!.message}`, 500))
+      api.get('/ok', handler)
+      api.get('/error', () => {
+        throw new Error('failed')
+      })
+      app.route('/', api)
+      app.get('/error', () => {
+        throw new Error('failed')
+      })
+      app.onError((c) => c.text('Fallback', 500))
+
+      expect(app.routes.find((route) => route.path === '/api/ok')?.handler).toBe(handler)
+      const res = app.request('/api/ok')
+      expect(res).toBeInstanceOf(Response)
+      expect(await (res as Response).text()).toBe('OK')
+      expect(await (await app.request('/api/error')).text()).toBe('API: failed')
+      expect(await (await app.request('/error')).text()).toBe('Fallback')
+    })
+
+    it('Should delegate to the built-in error handler when every middleware calls next()', async () => {
+      const app = new Hono()
+      app.onError(async (c, next) => {
+        await next()
+        c.header('x-error-middleware', 'true')
+      })
+      app.get('/error', () => {
+        throw new HTTPException(401, { message: 'Unauthorized' })
+      })
+
+      const res = await app.request('/error')
+      expect(res.status).toBe(401)
+      expect(await res.text()).toBe('Unauthorized')
+      expect(res.headers.get('x-error-middleware')).toBe('true')
+    })
+
+    it('Should expose the middleware signature through ErrorHandler', async () => {
+      const app = new Hono()
+      const middleware: ErrorHandler = async (c, next) => {
+        expectTypeOf(c).toEqualTypeOf<Context>()
+        expectTypeOf(next).toEqualTypeOf<Next>()
+        expectTypeOf(c.error).toEqualTypeOf<Error | undefined>()
+        await next()
+      }
+      const handler: ErrorHandler = (c) => c.text(c.error!.message, 500)
+      app.onError(middleware, handler)
+      app.get('/error', () => {
+        throw new Error('failed')
+      })
+
+      expect(await (await app.request('/error')).text()).toBe('failed')
+
+      // @ts-expect-error The legacy (error, context) signature is no longer accepted.
+      new Hono().onError((error: Error, c: Context) => c.text(error.message, 500))
+    })
+
+    it('Should run nested application middleware before parent middleware', async () => {
+      const app = new Hono()
+      const sub = new Hono()
+      const nested = new Hono()
+      const calls: string[] = []
+
+      app.onError(async (_c, next) => {
+        calls.push('app')
+        await next()
+      })
+      sub.onError(async (_c, next) => {
+        calls.push('sub')
+        await next()
+      })
+      nested.onError(async (c) => {
+        calls.push('nested')
+        return c.text(c.error!.message, 500)
+      })
+      nested.get('/error', () => {
+        throw new Error('Error')
+      })
+      sub.route('/', nested)
+      app.route('/', sub)
+
+      const res = await app.request('/error')
+      expect(await res.text()).toBe('Error')
+      expect(calls).toEqual(['nested'])
+    })
+
+    it('Should continue through parent application middleware', async () => {
+      const app = new Hono()
+      const sub = new Hono()
+      const calls: string[] = []
+
+      app.onError(async (c) => {
+        calls.push('app')
+        return c.text(c.error!.message, 500)
+      })
+      sub.onError(async (_c, next) => {
+        calls.push('sub')
+        await next()
+      })
+      sub.get('/error', () => {
+        throw new Error('Error')
+      })
+      app.route('/', sub)
+
+      const res = await app.request('/error')
+      expect(await res.text()).toBe('Error')
+      expect(calls).toEqual(['sub', 'app'])
+    })
+
+    it('Should scope error middleware by path', async () => {
+      const app = new Hono()
+      const api = new Hono()
+
+      api.onError(
+        '/items/*',
+        async (c, next) => {
+          await next()
+          c.header('x-error-scope', 'items')
+        },
+        async (c) => c.text(`items: ${c.error!.message}`, 500)
+      )
+      api.get('/items/:id', () => {
+        throw new Error('failed')
+      })
+      api.get('/other', () => {
+        throw new Error('failed')
+      })
+      app.route('/api', api)
+      app.onError((c) => c.text(`app: ${c.error!.message}`, 500))
+
+      let res = await app.request('/api/items/1')
+      expect(res.headers.get('x-error-scope')).toBe('items')
+      expect(await res.text()).toBe('items: failed')
+
+      res = await app.request('/api/other')
+      expect(res.headers.get('x-error-scope')).toBeNull()
+      expect(await res.text()).toBe('app: failed')
+    })
+
+    it('Should compose separate registrations within a sub-application', async () => {
+      const app = new Hono()
+      const api = new Hono()
+      const calls: string[] = []
+
+      api.onError(async (_c, next) => {
+        calls.push('middleware')
+        await next()
+      })
+      api.onError((c) => {
+        calls.push('onError')
+        return c.text(c.error!.message, 500)
+      })
+      api.get('/error', () => {
+        throw new Error('Error')
+      })
+      app.route('/api', api)
+
+      const res = await app.request('/api/error')
+      expect(await res.text()).toBe('Error')
+      expect(calls).toEqual(['middleware', 'onError'])
+    })
+
+    it('Should replace a response when a sub-application throws after next()', async () => {
+      const app = new Hono()
+      const api = new Hono()
+
+      api.use(async (_c, next) => {
+        await next()
+        throw new Error('Error after response')
+      })
+      api.get('/item', (c) => c.text('Item'))
+      api.onError((c) => c.text(c.error!.message, 500))
+      app.route('/api', api)
+
+      const res = await app.request('/api/item')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Error after response')
+    })
+
+    it('Should compose multiple registrations in order', async () => {
+      const app = new Hono()
+      const calls: string[] = []
+
+      app.onError(async (c, next) => {
+        calls.push(`before:${c.req.param('id')}:${c.error?.message}`)
+        await next()
+        calls.push(`after:${c.req.param('id')}`)
+        c.res.headers.set('x-error-middleware', 'true')
+      })
+      app.onError(async (_c, next) => {
+        calls.push('second')
+        await next()
+      })
+      app.onError((c) => {
+        calls.push('handler')
+        return c.text(c.error!.message, 500)
+      })
+
+      app.get('/posts/:id', () => {
+        throw new Error('This is Error')
+      })
+
+      const res = await app.request('https://example.com/posts/123')
+      expect(res.status).toBe(500)
+      expect(res.headers.get('x-error-middleware')).toBe('true')
+      expect(await res.text()).toBe('This is Error')
+      expect(calls).toEqual(['before:123:This is Error', 'second', 'handler', 'after:123'])
+    })
+
+    it('Should infer variables from middleware', async () => {
+      const setMessage: MiddlewareHandler<{
+        Variables: { message: string }
+      }> = async (c, next) => {
+        c.set('message', 'Caught')
+        await next()
+      }
+      const app = new Hono()
+        .onError(setMessage, async (c) => c.text(c.var.message, 500))
+        .get('/error', () => {
+          throw new Error('Error')
+        })
+
+      expect(await (await app.request('/error')).text()).toBe('Caught')
+    })
+
+    it('Should replace an existing response', async () => {
+      const app = new Hono()
+
+      app.use(async (_c, next) => {
+        await next()
+        throw new Error('Error after response')
+      })
+      app.get('/posts/:id', (c) => c.text('OK'))
+      app.onError(async (_c, next) => {
+        await next()
+      })
+      app.onError((c) => c.text(c.error!.message, 500))
+
+      const res = await app.request('https://example.com/posts/123')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Error after response')
+    })
+
+    it.each([false, true])(
+      'Should preserve explicit error response headers with upstream middleware: %s',
+      async (withMiddleware) => {
+        const app = createApp(withMiddleware)
+        app.get('/', (c) => {
+          c.header('Cache-Control', 'public, max-age=3600')
+          c.header('Set-Cookie', 'session=old')
+          c.header('x-request', 'kept')
+          throw new Error('Failed')
+        })
+        app.onError(async (c, next) => {
+          c.header('x-error', 'handled')
+          await next()
+        })
+        app.onError((c) =>
+          c.text(c.error!.message, 500, {
+            'Cache-Control': 'no-store',
+            'Set-Cookie': ['session=new', 'error=1'],
+          })
+        )
+
+        const res = await app.request('/')
+        expect(res.status).toBe(500)
+        expect(await res.text()).toBe('Failed')
+        expect(res.headers.get('Cache-Control')).toBe('no-store')
+        expect(res.headers.getSetCookie()).toEqual(['session=new', 'error=1'])
+        expect(res.headers.get('x-request')).toBe('kept')
+        expect(res.headers.get('x-error')).toBe('handled')
+      }
+    )
+
+    it('Should preserve explicit headers on a raw error response', async () => {
+      const app = new Hono()
+      app.get('/', (c) => {
+        c.header('Cache-Control', 'public, max-age=3600')
+        c.header('Set-Cookie', 'session=old')
+        throw new Error('Failed')
+      })
+      app.onError(
+        () =>
+          new Response('Failed', {
+            status: 500,
+            headers: { 'Cache-Control': 'no-store', 'Set-Cookie': 'session=new' },
+          })
+      )
+
+      const res = await app.request('/')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Failed')
+      expect(res.headers.get('Cache-Control')).toBe('no-store')
+      expect(res.headers.getSetCookie()).toEqual(['session=new'])
+    })
+
+    it.each([false, true])(
+      'Should return Response.error() from error middleware with upstream middleware: %s',
+      async (withMiddleware) => {
+        const app = createApp(withMiddleware)
+        const response = Response.error()
+        app.onError(() => response)
+        app.get('/', () => {
+          throw new Error('Failed')
+        })
+
+        expect(await app.request('/')).toBe(response)
+      }
+    )
+
+    it('Should allow error middleware to edit immutable response headers before next()', async () => {
+      const app = new Hono()
+      const redirect = Response.redirect('http://localhost/redirect')
+
+      app.use(async (_c, next) => {
+        await next()
+        throw new Error('Error after redirect')
+      })
+      app.get('/', () => redirect)
+      app.onError(async (c, next) => {
+        c.header('location', undefined)
+        c.header('x-error', 'handled')
+        await next()
+      })
+      app.onError((c) => c.text(c.error!.message, 500))
+
+      const res = await app.request('/')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Error after redirect')
+      expect(res.headers.get('x-error')).toBe('handled')
+      expect(res.headers.has('location')).toBe(false)
+      expect(redirect.headers.get('location')).toBe('http://localhost/redirect')
+    })
+
+    it.each(['consumed', 'locked'])(
+      'Should handle errors when the existing response body is %s',
+      async (state) => {
+        const app = new Hono()
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+        app.use(async (c, next) => {
+          await next()
+          if (state === 'consumed') {
+            expect(await c.res.text()).toBe('OK')
+          } else {
+            reader = c.res.body!.getReader()
+          }
+          throw new Error('Error after response')
+        })
+        app.get('/', (c) => c.text('OK'))
+        app.onError((c) => c.text(c.error!.message, 500))
+
+        try {
+          const res = await app.request('/')
+          expect(res.status).toBe(500)
+          expect(await res.text()).toBe('Error after response')
+        } finally {
+          reader?.releaseLock()
+        }
+      }
+    )
+
+    it('Should allow middleware to return a response', async () => {
+      const app = new Hono()
+
+      app.onError(async (c) => c.text(`Caught: ${c.error!.message}`, 500))
+      app.onError((c) => c.text('Fallback Error', 500))
+      app.get('/error', () => {
+        throw new Error('Error')
+      })
+
+      const res = await app.request('/error')
+      expect(await res.text()).toBe('Caught: Error')
+    })
+
+    it('Should use the built-in handler if error middleware throws, without restarting the chain', async () => {
+      const app = new Hono()
+      const error = new Error('Error in onError')
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const handler = vi.fn(() => {
+        throw error
+      })
+      const fallback = vi.fn((c: Context) => c.text('Fallback', 500))
+
+      app.onError(handler)
+      app.onError(fallback)
+      app.get('/error', () => {
+        throw new Error('Original error')
+      })
+
+      const res = await app.request('/error')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Internal Server Error')
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(fallback).not.toHaveBeenCalled()
+      expect(log).toHaveBeenCalledExactlyOnceWith(error)
+      log.mockRestore()
+    })
+
+    it('Should stop at the first responding handler instead of replacing earlier registrations', async () => {
+      const app = new Hono()
+
+      app.onError((c) => c.text('First', 500))
+      app.onError((c) => c.text('Second', 500))
+      app.get('/error', () => {
+        throw new Error('Error')
+      })
+
+      expect(await (await app.request('/error')).text()).toBe('First')
+    })
+
+    it('Should preserve the route that threw after next()', async () => {
+      const app = new Hono()
+
+      app.use('/posts/*', async (_c, next) => {
+        await next()
+        throw new Error('Error after next')
+      })
+      app.get('/posts/:id', (c) => c.text('OK'))
+      app.onError((c) =>
+        c.json(
+          {
+            message: c.error!.message,
+            param: c.req.param('id'),
+            routePath: routePath(c),
+          },
+          500
+        )
+      )
+
+      const res = await app.request('https://example.com/posts/123')
+      expect(res.status).toBe(500)
+      expect(await res.json()).toEqual({
+        message: 'Error after next',
+        param: undefined,
+        routePath: '/posts/*',
+      })
+    })
+  })
+
   describe('notFound', () => {
     const app = new Hono()
     const sub = new Hono()
@@ -1975,6 +2595,8 @@ describe('Hono with `app.route`', () => {
     app.get('/explicit-404', async (c) => {
       c.header('explicit', '1')
     })
+
+    app.get('/sub/not-found-from-app', (c) => c.notFound())
 
     app.notFound((c) => {
       return c.text('404 Not Found by app', 404)
@@ -2001,11 +2623,17 @@ describe('Hono with `app.route`', () => {
       expect(await res.text()).toBe('404 Not Found by app')
     })
 
-    it('/sub/explicit-404 should be handled on app', async () => {
+    it('/sub/explicit-404 should be handled by sub as an implicit 404', async () => {
       const res = await app.request('https://example.com/sub/explicit-404')
       expect(res.status).toBe(404)
       expect(res.headers.get('explicit')).toBe('1')
-      expect(await res.text()).toBe('404 Not Found by app')
+      expect(await res.text()).toBe('404 Not Found by sub')
+    })
+
+    it('c.notFound() should prefer the matching sub-app scope over the original route owner', async () => {
+      const res = await app.request('https://example.com/sub/not-found-from-app')
+      expect(res.status).toBe(404)
+      expect(await res.text()).toBe('404 Not Found by sub')
     })
 
     it('/implicit-404 should be handled by app', async () => {
@@ -2019,8 +2647,669 @@ describe('Hono with `app.route`', () => {
       const res = await app.request('https://example.com/sub/implicit-404')
       expect(res.status).toBe(404)
       expect(res.headers.get('explicit')).toBe(null)
-      expect(await res.text()).toBe('404 Not Found by app')
+      expect(await res.text()).toBe('404 Not Found by sub')
     })
+
+    it('Should preserve route metadata and resume upstream middleware for c.notFound()', async () => {
+      const app = new Hono()
+      const sub = new Hono()
+
+      app.use('*', async (c, next) => {
+        try {
+          await next()
+          c.header('x-after-next', 'true')
+        } catch {
+          return c.text('caught', 500)
+        }
+      })
+      sub.get('/posts/:id', (c) => c.notFound())
+      sub.notFound(async (c) => c.text(`sub: ${c.req.param('id')}`, 404))
+      app.route('/sub', sub)
+
+      const res = await app.request('/sub/posts/123')
+      expect(res.status).toBe(404)
+      expect(res.headers.get('x-after-next')).toBe('true')
+      expect(await res.text()).toBe('sub: 123')
+    })
+
+    it('Should preserve cached RegExpRouter matches across fallback dispatches', async () => {
+      const errorApp = new Hono({ router: new RegExpRouter() })
+      let handlerCalls = 0
+      errorApp.all('/error', () => {
+        handlerCalls++
+        throw new HTTPException(500)
+      })
+
+      let res = await errorApp.request('/error')
+      expect(res.status).toBe(500)
+      res = await errorApp.request('/error')
+      expect(res.status).toBe(500)
+      expect(handlerCalls).toBe(2)
+
+      const notFoundApp = new Hono({ router: new RegExpRouter() })
+      let middlewareCalls = 0
+      notFoundApp.use('/missing', async (_c, next) => {
+        middlewareCalls++
+        await next()
+      })
+
+      res = await notFoundApp.request('/missing')
+      expect(res.status).toBe(404)
+      res = await notFoundApp.request('/missing')
+      expect(res.status).toBe(404)
+      expect(middlewareCalls).toBe(2)
+    })
+
+    it('Should terminate recursive error and not-found dispatches', async () => {
+      const app = new Hono()
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+      app.notFound(() => {
+        throw new Error('not found error')
+      })
+      app.onError((c) => c.notFound())
+
+      const res = await app.request('/')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Internal Server Error')
+      expect(log).toHaveBeenCalledTimes(1)
+      log.mockRestore()
+    })
+  })
+
+  describe('notFound middleware', () => {
+    it.each(['/missing', '/explicit'])(
+      'Should preserve explicit not-found response headers for %s',
+      async (path) => {
+        const app = new Hono()
+        app.use(async (c, next) => {
+          c.header('Cache-Control', 'public, max-age=3600')
+          c.header('Set-Cookie', 'session=old')
+          c.header('x-request', 'kept')
+          await next()
+        })
+        app.get('/explicit', (c) => c.notFound())
+        app.notFound(async (c, next) => {
+          await next()
+          c.header('x-not-found', 'handled')
+        })
+        app.notFound((c) =>
+          c.text('Not found', 404, {
+            'Cache-Control': 'no-store',
+            'Set-Cookie': ['session=new', 'missing=1'],
+          })
+        )
+
+        const res = await app.request(path)
+        expect(res.status).toBe(404)
+        expect(await res.text()).toBe('Not found')
+        expect(res.headers.get('Cache-Control')).toBe('no-store')
+        expect(res.headers.getSetCookie()).toEqual(['session=new', 'missing=1'])
+        expect(res.headers.get('x-request')).toBe('kept')
+        expect(res.headers.get('x-not-found')).toBe('handled')
+      }
+    )
+
+    it('Should allow header edits after adopting an immutable not-found response', async () => {
+      const app = new Hono()
+      const redirect = Response.redirect('http://localhost/redirect')
+      app.notFound(() => redirect)
+      app.get('/', async (c) => {
+        const res = await c.notFound()
+        expect(c.finalized).toBe(false)
+        c.res = res
+        c.header('x-after-not-found', 'handled')
+        return c.res
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(302)
+      expect(res.headers.get('location')).toBe('http://localhost/redirect')
+      expect(res.headers.get('x-after-not-found')).toBe('handled')
+      expect(redirect.headers.has('x-after-not-found')).toBe(false)
+    })
+
+    it.each([false, true])(
+      'Should return Response.error() from not-found middleware with upstream middleware: %s',
+      async (withMiddleware) => {
+        const app = createApp(withMiddleware)
+        const response = Response.error()
+        app.notFound(() => response)
+        app.get('/explicit', (c) => c.notFound())
+
+        expect(await app.request('/missing')).toBe(response)
+        expect(await app.request('/explicit')).toBe(response)
+      }
+    )
+
+    it.each([false, true])(
+      'Should preserve wrapper headers around c.notFound() with upstream middleware: %s',
+      async (withMiddleware) => {
+        const app = createApp(withMiddleware)
+        app.notFound((c) =>
+          c.text('Missing', 404, { 'Cache-Control': 'public', 'Set-Cookie': 'session=old' })
+        )
+        app.get('/', async (c) => {
+          const res = await c.notFound()
+          return new Response(res.body, {
+            status: 410,
+            headers: { 'Cache-Control': 'no-store', 'Set-Cookie': 'session=new' },
+          })
+        })
+
+        const res = await app.request('/')
+        expect(res.status).toBe(410)
+        expect(await res.text()).toBe('Missing')
+        expect(res.headers.get('Cache-Control')).toBe('no-store')
+        expect(res.headers.getSetCookie()).toEqual(['session=new'])
+      }
+    )
+
+    it('Should not retain a discarded not-found response in the context', async () => {
+      const app = new Hono()
+      app.notFound((c) => c.text('Missing', 404, { 'x-not-found': 'discarded' }))
+      app.get('/', async (c) => {
+        await c.notFound()
+        expect(c.finalized).toBe(false)
+        return c.text('OK')
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(200)
+      expect(await res.text()).toBe('OK')
+      expect(res.headers.has('x-not-found')).toBe(false)
+    })
+
+    it.each([false, true])(
+      'Should allow wrapping c.notFound() with upstream middleware: %s',
+      async (withMiddleware) => {
+        const app = createApp(withMiddleware)
+        app.notFound(async (c, next) => {
+          await next()
+          expect(c.finalized).toBe(true)
+          c.header('x-not-found', 'handled')
+        })
+        app.get('/', async (c) => {
+          const res = await c.notFound()
+          expect(c.finalized).toBe(false)
+          return new Response(res.clone().body, { status: 410, headers: res.headers })
+        })
+
+        const res = await app.request('/')
+        expect(res.status).toBe(410)
+        expect(await res.text()).toBe('404 Not Found')
+        expect(res.headers.get('x-not-found')).toBe('handled')
+      }
+    )
+
+    it('Should preserve an already finalized context after c.notFound()', async () => {
+      const app = new Hono()
+      app.notFound(async (_c, next) => {
+        await next()
+      })
+      app.get('/', async (c) => {
+        const prepared = c.text('Prepared', 202)
+        c.res = prepared
+        const res = await c.notFound()
+        expect(c.finalized).toBe(true)
+        expect(c.res).toBe(prepared)
+        return res
+      })
+
+      expect((await app.request('/')).status).toBe(404)
+    })
+
+    it('Should allow not-found middleware to edit an existing immutable response', async () => {
+      const app = new Hono()
+      const redirect = Response.redirect('http://localhost/redirect')
+      app.notFound(async (c, next) => {
+        c.header('location', undefined)
+        c.header('x-not-found', 'handled')
+        await next()
+      })
+      app.get('/', async (c) => {
+        c.res = redirect
+        const res = await c.notFound()
+        expect(c.finalized).toBe(true)
+        return res
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(404)
+      expect(await res.text()).toBe('404 Not Found')
+      expect(res.headers.get('x-not-found')).toBe('handled')
+      expect(res.headers.has('location')).toBe(false)
+      expect(redirect.headers.get('location')).toBe('http://localhost/redirect')
+    })
+
+    it('Should preserve an unfinalized response after c.notFound()', async () => {
+      const app = new Hono()
+      app.notFound((c) => {
+        c.header('x-not-found', 'temporary')
+        return c.text('Missing', 404)
+      })
+      app.get('/', async (c) => {
+        const original = c.res
+        original.headers.set('x-original', 'kept')
+        await c.notFound()
+        expect(c.finalized).toBe(false)
+        expect(c.res).toBe(original)
+        return c.text('OK')
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(200)
+      expect(res.headers.get('x-original')).toBe('kept')
+      expect(res.headers.has('x-not-found')).toBe(false)
+    })
+
+    it('Should restore response state when not-found middleware rejects while handling an error', async () => {
+      const app = new Hono()
+      app.use(async (_c, next) => {
+        await next()
+      })
+      app.notFound(async (c, next) => {
+        await next()
+        c.header('x-not-found', 'discarded')
+        throw 'Not-found failure'
+      })
+      app.get('/', async (c) => {
+        c.error = new Error('Original error')
+        await expect(c.notFound()).rejects.toThrow('Not-found failure')
+        expect(c.finalized).toBe(false)
+        return c.text('Recovered', 410)
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(410)
+      expect(await res.text()).toBe('Recovered')
+      expect(res.headers.has('x-not-found')).toBe(false)
+    })
+
+    it('Should restore an existing response when not-found middleware rejects while handling an error', async () => {
+      const app = new Hono()
+      app.notFound(async (c, next) => {
+        c.header('x-not-found', 'discarded')
+        await next()
+        throw 'Not-found failure'
+      })
+      app.get('/', async (c) => {
+        const original = c.text('Prepared', 202)
+        c.res = original
+        c.error = new Error('Original error')
+        await expect(c.notFound()).rejects.toThrow('Not-found failure')
+        expect(c.finalized).toBe(true)
+        expect(c.res).toBe(original)
+        return c.res
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(202)
+      expect(await res.text()).toBe('Prepared')
+      expect(res.headers.has('x-not-found')).toBe(false)
+    })
+
+    it.each([false, true])(
+      'Should handle non-Error throws from not-found middleware with upstream middleware: %s',
+      async (withMiddleware) => {
+        const app = createApp(withMiddleware)
+        app.notFound(async (_c, next) => {
+          await next()
+          throw 'Not-found failure'
+        })
+        app.onError((c) => {
+          expect(c.error).toBeInstanceOf(Error)
+          expect(c.error!.cause).toBe('Not-found failure')
+          return c.text(c.error!.message, 500)
+        })
+        app.get('/explicit', async (c) => {
+          const original = c.res
+          const res = await c.notFound()
+          expect(c.finalized).toBe(false)
+          expect(c.res).toBe(original)
+          return res
+        })
+
+        for (const path of ['/missing', '/explicit']) {
+          const res = await app.request(path)
+          expect(res.status).toBe(500)
+          expect(await res.text()).toBe('Not-found failure')
+        }
+      }
+    )
+
+    it('Should allow error middleware to wrap c.notFound()', async () => {
+      const app = new Hono()
+      app.notFound(async (_c, next) => {
+        await next()
+      })
+      app.onError(async (c) => {
+        const res = await c.notFound()
+        return new Response(res.body, { status: 503 })
+      })
+      app.get('/', () => {
+        throw new Error('Route error')
+      })
+
+      const res = await app.request('/')
+      expect(res.status).toBe(503)
+      expect(await res.text()).toBe('404 Not Found')
+    })
+
+    it.each([
+      ['RegExpRouter', RegExpRouter],
+      ['TrieRouter', TrieRouter],
+    ] as const)(
+      'Should handle not-found middleware errors before resuming upstream middleware with %s',
+      async (_name, Router) => {
+        const app = new Hono({ router: new Router() })
+        const caught = vi.fn()
+        const calls: string[] = []
+        app.use(async (c, next) => {
+          try {
+            await next()
+            calls.push('upstream')
+          } catch (error) {
+            caught(error)
+            return c.text('Intercepted', 503)
+          }
+        })
+        app.notFound(
+          async (c, next) => {
+            await next()
+            calls.push('not-found')
+            c.header('x-not-found', 'handled')
+          },
+          () => {
+            throw new Error('Not-found error')
+          }
+        )
+        app.onError((c) => {
+          calls.push('error')
+          return c.text(c.error!.message, 500)
+        })
+        app.get('/explicit', (c) => c.notFound())
+
+        for (const path of ['/missing', '/explicit']) {
+          calls.length = 0
+          const res = await app.request(path)
+          expect(res.status).toBe(500)
+          expect(await res.text()).toBe('Not-found error')
+          expect(res.headers.get('x-not-found')).toBe('handled')
+          expect(calls).toEqual(['error', 'not-found', 'upstream'])
+          expect(caught).not.toHaveBeenCalled()
+        }
+      }
+    )
+
+    it('Should not re-enter error middleware when it invokes failing not-found middleware', async () => {
+      const app = new Hono()
+      const error = new HTTPException(503, { message: 'Not-found error' })
+      const notFound = vi.fn(() => {
+        throw error
+      })
+      const onError = vi.fn((c: Context) => c.notFound())
+      app.notFound(notFound)
+      app.onError(onError)
+
+      const res = await app.request('/missing')
+      expect(res.status).toBe(503)
+      expect(await res.text()).toBe('Not-found error')
+      expect(notFound).toHaveBeenCalledTimes(2)
+      expect(onError).toHaveBeenCalledTimes(1)
+    })
+
+    it('Should compose middleware with synchronous handlers for implicit and explicit not found', async () => {
+      const app = new Hono()
+      app.notFound(
+        '/items/*',
+        async (c, next) => {
+          await next()
+          c.header('x-not-found', 'items')
+        },
+        (c) => c.text('Items Not Found', 404)
+      )
+      app.notFound((c) => c.text('Fallback Not Found', 404))
+      app.get('/items/explicit', (c) => c.notFound())
+
+      for (const path of ['/items/missing', '/items/explicit']) {
+        const res = await app.request(path)
+        expect(res.status).toBe(404)
+        expect(await res.text()).toBe('Items Not Found')
+        expect(res.headers.get('x-not-found')).toBe('items')
+      }
+      expect(await (await app.request('/other')).text()).toBe('Fallback Not Found')
+    })
+
+    it('Should run nested application middleware before parent middleware', async () => {
+      const app = new Hono()
+      const sub = new Hono()
+
+      app.notFound(async (c) => c.text('App Not Found', 404))
+      sub.notFound(async (c) => c.text('Sub Not Found', 404))
+      app.route('/', sub)
+
+      const res = await app.request('/missing')
+      expect(await res.text()).toBe('Sub Not Found')
+    })
+
+    it('Should scope not-found middleware by path', async () => {
+      const app = new Hono()
+
+      app.notFound('/items/*', async (c) => c.text('Items Not Found', 404))
+      app.notFound((c) => c.text('App Not Found', 404))
+
+      let res = await app.request('/items/missing')
+      expect(await res.text()).toBe('Items Not Found')
+
+      res = await app.request('/other')
+      expect(await res.text()).toBe('App Not Found')
+    })
+
+    it('Should compose middleware and a final handler across multiple registrations', async () => {
+      const app = new Hono()
+      const calls: string[] = []
+
+      app.notFound(async (c, next) => {
+        calls.push(`before:${c.req.param('id')}`)
+        await next()
+        calls.push(`after:${c.req.param('id')}`)
+        c.res.headers.set('x-not-found-middleware', 'true')
+      })
+      app.notFound(async (_c, next) => {
+        calls.push('second')
+        await next()
+      })
+      app.notFound((c) => {
+        calls.push('handler')
+        return c.text('Custom Not Found', 404)
+      })
+
+      app.get('/posts/:id', (c) => c.notFound())
+
+      const res = await app.request('https://example.com/posts/123')
+      expect(res.status).toBe(404)
+      expect(res.headers.get('x-not-found-middleware')).toBe('true')
+      expect(await res.text()).toBe('Custom Not Found')
+      expect(calls).toEqual(['before:123', 'second', 'handler', 'after:123'])
+    })
+
+    it('Should allow middleware to return a response', async () => {
+      const app = new Hono()
+
+      app.notFound(async (c) => c.text('Middleware Not Found', 404))
+      app.notFound((c) => c.text('Handler Not Found', 404))
+
+      const res = await app.request('https://example.com/missing')
+      expect(res.status).toBe(404)
+      expect(await res.text()).toBe('Middleware Not Found')
+    })
+
+    it('Should pass errors thrown by middleware to the error middleware', async () => {
+      const app = new Hono()
+
+      app.notFound(async () => {
+        throw new Error('Error in notFound')
+      })
+      app.onError(async (c) => c.text(c.error!.message, 500))
+
+      const res = await app.request('/missing')
+      expect(res.status).toBe(500)
+      expect(await res.text()).toBe('Error in notFound')
+    })
+
+    it('Should compose path-matched fallback routes in registration order', async () => {
+      const app = new Hono()
+      const api = app.basePath('/api')
+      const tenant = app.basePath('/:tenant')
+
+      api.notFound(async (c) => c.text('API Not Found', 404))
+      tenant.notFound(async (c) => c.text('Tenant Not Found', 404))
+      app.notFound((c) => c.text('App Not Found', 404))
+      api.get('/missing', (c) => c.notFound())
+      tenant.get('/missing', (c) => c.notFound())
+      app.get('/api/from-app', (c) => c.notFound())
+
+      let res = await app.request('https://example.com/')
+      expect(await res.text()).toBe('App Not Found')
+
+      res = await app.request('https://example.com/api/missing')
+      expect(await res.text()).toBe('API Not Found')
+
+      res = await app.request('https://example.com/api/from-app')
+      expect(await res.text()).toBe('API Not Found')
+
+      res = await app.request('https://example.com/api/implicit')
+      expect(await res.text()).toBe('API Not Found')
+
+      res = await app.request('https://example.com/acme/missing')
+      expect(await res.text()).toBe('Tenant Not Found')
+
+      const rootFirst = new Hono()
+      const rootFirstApi = rootFirst.basePath('/api')
+      rootFirst.notFound(async (c) => c.text('App Not Found', 404))
+      rootFirstApi.notFound(async (c) => c.text('API Not Found', 404))
+      rootFirstApi.get('/missing', (c) => c.notFound())
+
+      res = await rootFirst.request('https://example.com/api/missing')
+      expect(await res.text()).toBe('App Not Found')
+
+      const nested = new Hono()
+      const parent = nested.basePath('/parent')
+      const child = parent.basePath('/child')
+      parent.notFound(async (c) => c.text('Parent Not Found', 404))
+      nested.notFound(async (c) => c.text('Root Not Found', 404))
+      child.get('/missing', (c) => c.notFound())
+
+      res = await nested.request('https://example.com/parent/child/missing')
+      expect(await res.text()).toBe('Parent Not Found')
+    })
+
+    it('Should not change the current route path', async () => {
+      const app = new Hono()
+
+      app
+        .get('/a', async (_c, next) => next())
+        .notFound(async (_c, next) => next())
+        .onError(async (_c, next) => next())
+        .get((c) => c.text('A'))
+
+      expect(await (await app.request('/a')).text()).toBe('A')
+      expect((await app.request('/b')).status).toBe(404)
+    })
+
+    it('Should stop at the first not-found handler that returns a response', async () => {
+      const app = new Hono()
+
+      app.notFound((c) => c.text('First', 404))
+      app.notFound((c) => c.text('Second', 404))
+
+      expect(await (await app.request('/missing')).text()).toBe('First')
+    })
+  })
+
+  describe.each([
+    ['RegExpRouter', RegExpRouter],
+    ['TrieRouter', TrieRouter],
+    ['LinearRouter', LinearRouter],
+  ] as const)('Fallback scope parameters with %s', (_name, Router) => {
+    it('Should allow absent scope parameters for implicit not found', async () => {
+      const app = new Hono({ router: new Router() })
+      app.notFound('/:tenant/*', (c) =>
+        c.text(c.req.param('tenant')?.toUpperCase() ?? 'Unknown tenant', 404)
+      )
+
+      const res = await app.request('/acme/missing')
+      expect(res.status).toBe(404)
+      expect(await res.text()).toBe('Unknown tenant')
+    })
+
+    it.each(['onError', 'notFound'] as const)(
+      'Should preserve original route parameters in %s',
+      async (method) => {
+        const app = new Hono({ router: new Router() })
+        app.get('/items/:id', (c) => {
+          if (method === 'onError') {
+            throw new Error('Error')
+          }
+          return c.notFound()
+        })
+        app[method]('/:scope/*', (c) => {
+          expect(c.req.param('scope')).toBeUndefined()
+          return c.json({ params: c.req.param(), route: routePath(c) })
+        })
+
+        const res = await app.request('/items/123')
+        expect(await res.json()).toEqual({ params: { id: '123' }, route: '/items/:id' })
+      }
+    )
+  })
+
+  it('Should register and execute fallback handlers through the router', async () => {
+    const registrations: string[] = []
+    const executions: string[] = []
+    const delegate = new RegExpRouter<[H, RouterRoute]>()
+    const router: Router<[H, RouterRoute]> = {
+      name: 'WrappingRouter',
+      add(method, path, [handler, route]) {
+        registrations.push(`${method} ${path}`)
+        delegate.add(method, path, [
+          async (c, next) => {
+            executions.push(`${method} ${path}`)
+            return handler(c, next)
+          },
+          route,
+        ])
+      },
+      match(method, path): Result<[H, RouterRoute]> {
+        return delegate.match(method, path)
+      },
+    }
+    const app = new Hono({ router })
+
+    app.notFound(
+      async (_c, next) => {
+        await next()
+      },
+      async (c) => c.text('Not Found', 404)
+    )
+    app.onError(async (_c, next) => {
+      await next()
+    })
+    app.onError((c) => c.text(c.error!.message, 500))
+    app.get('/error', () => {
+      throw new Error('Error')
+    })
+
+    let res = await app.request('https://example.com/missing')
+    expect(res.status).toBe(404)
+    res = await app.request('https://example.com/error')
+    expect(res.status).toBe(500)
+
+    expect(registrations).toContain(`${METHOD_NAME_NOT_FOUND} /*`)
+    expect(registrations).toContain(`${METHOD_NAME_ERROR} /*`)
+    expect(app.routes.filter((route) => route.method[0] === '@')).toHaveLength(4)
+    expect(executions.filter((entry) => entry === `${METHOD_NAME_NOT_FOUND} /*`)).toHaveLength(2)
+    expect(executions.filter((entry) => entry === `${METHOD_NAME_ERROR} /*`)).toHaveLength(2)
   })
 })
 
@@ -2142,7 +3431,7 @@ describe('Multiple paths with one handler', () => {
   app.on('GET', paths, (c) => {
     return c.json({
       path: c.req.path,
-      routePath: c.req.routePath,
+      routePath: routePath(c),
     })
   })
 
@@ -2215,24 +3504,6 @@ describe('Multiple handler', () => {
         const res = await app.request('/123/456')
         expect(res.status).toBe(200)
         expect(await res.text()).toBe('id is 123')
-      })
-    })
-
-    describe('self with trailing static is stable across SmartRouter fallback', () => {
-      it('Should return the first id whether or not an unrelated route is registered', async () => {
-        const a = new Hono()
-        a.get('/:id/:id/x', (c) => c.text(c.req.param('id')))
-        const resA = await a.request('/123/456/x')
-        expect(resA.status).toBe(200)
-        expect(await resA.text()).toBe('123')
-
-        const b = new Hono()
-        b.get('/:id/:id/x', (c) => c.text(c.req.param('id')))
-        b.get('/a', (c) => c.text('a'))
-        const resB = await b.request('/123/456/x')
-        expect(resB.status).toBe(200)
-        expect(await resB.text()).toBe('123')
-        expect(b.router.name).toBe('SmartRouter + TrieRouter')
       })
     })
 
@@ -2336,8 +3607,8 @@ describe('Context is not finalized', () => {
     app.get('/foo', (c) => {
       return c.text('foo')
     })
-    app.onError((err, c) => {
-      return c.text(err.message, 500)
+    app.onError((c) => {
+      return c.text(c.error!.message, 500)
     })
     const res = await app.request('http://localhost/foo')
     expect(res.status).toBe(500)
@@ -2352,8 +3623,8 @@ describe('Context is not finalized', () => {
 
     // @ts-ignore
     app.get('/foo', () => {})
-    app.onError((err, c) => {
-      return c.text(err.message, 500)
+    app.onError((c) => {
+      return c.text(c.error!.message, 500)
     })
     const res = await app.request('http://localhost/foo')
     expect(res.status).toBe(500)
@@ -2457,8 +3728,10 @@ describe('Count of logger called', () => {
   })
 
   it('Should be called two times / Custom Not Found', async () => {
-    app.notFound((c) => c.text('Custom Not Found', 404))
-    const res = await app.request('http://localhost/custom-not-found')
+    const customApp = new Hono()
+    customApp.use('*', logger(logFn))
+    customApp.notFound((c) => c.text('Custom Not Found', 404))
+    const res = await customApp.request('http://localhost/custom-not-found')
     expect(res).not.toBeNull()
     expect(res.status).toBe(404)
     expect(await res.text()).toBe('Custom Not Found')
@@ -2631,299 +3904,6 @@ describe('Optional parameters', () => {
   })
 })
 
-describe('app.mount()', () => {
-  describe('Basic', () => {
-    const anotherApp = (req: Request, ...params: unknown[]) => {
-      const path = getPath(req)
-      if (path === '/') {
-        return new Response('AnotherApp')
-      }
-      if (path === '/hello') {
-        return new Response('Hello from AnotherApp')
-      }
-      if (path === '/header') {
-        const message = req.headers.get('x-message')
-        return new Response(message)
-      }
-      if (path === '/with-query') {
-        const queryStrings = new URL(req.url).searchParams.toString()
-        return new Response(queryStrings)
-      }
-      if (path == '/with-params') {
-        return new Response(
-          JSON.stringify({
-            params,
-          }),
-          {
-            headers: {
-              'Content-Type': 'application.json',
-            },
-          }
-        )
-      }
-      if (path === '/undefined') {
-        return undefined as unknown as Response
-      }
-      return new Response('Not Found from AnotherApp', {
-        status: 404,
-      })
-    }
-
-    const app = new Hono()
-    app.use('*', async (c, next) => {
-      await next()
-      c.header('x-message', 'Foo')
-    })
-    app.get('/', (c) => c.text('Hono'))
-    app.notFound((c) => {
-      return c.text('Not Found from App', 404)
-    })
-
-    app.mount('/another-app', anotherApp, () => {
-      return 'params'
-    })
-    app.mount('/another-app-with-array-option', anotherApp, () => {
-      return ['param1', 'param2']
-    })
-    app.mount('/another-app2/sub-slash/', anotherApp)
-
-    const api = new Hono().basePath('/api')
-    api.mount('/another-app', anotherApp)
-
-    it('Should return responses from Hono app', async () => {
-      const res = await app.request('/')
-      expect(res.status).toBe(200)
-      expect(res.headers.get('x-message')).toBe('Foo')
-      expect(await res.text()).toBe('Hono')
-    })
-
-    it('Should return responses from AnotherApp', async () => {
-      let res = await app.request('/another-app')
-      expect(res.status).toBe(200)
-      expect(res.headers.get('x-message')).toBe('Foo')
-      expect(await res.text()).toBe('AnotherApp')
-
-      res = await app.request('/another-app/hello')
-      expect(res.status).toBe(200)
-      expect(res.headers.get('x-message')).toBe('Foo')
-      expect(await res.text()).toBe('Hello from AnotherApp')
-
-      const req = new Request('http://localhost/another-app/header', {
-        headers: {
-          'x-message': 'Message Foo!',
-        },
-      })
-      res = await app.request(req)
-      expect(res.status).toBe(200)
-      expect(res.headers.get('x-message')).toBe('Foo')
-      expect(await res.text()).toBe('Message Foo!')
-
-      res = await app.request('/another-app/not-found')
-      expect(res.status).toBe(404)
-      expect(res.headers.get('x-message')).toBe('Foo')
-      expect(await res.text()).toBe('Not Found from AnotherApp')
-
-      res = await app.request('/another-app/with-query?foo=bar&baz=qux')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('foo=bar&baz=qux')
-
-      res = await app.request('/another-app/with-params')
-      expect(res.status).toBe(200)
-      expect(await res.json()).toEqual({
-        params: ['params'],
-      })
-
-      res = await app.request('/another-app/undefined')
-      expect(res.status).toBe(404)
-      expect(await res.text()).toBe('Not Found from App')
-    })
-
-    it('Should return response from Another app with an array option', async () => {
-      const res = await app.request('/another-app-with-array-option/with-params')
-      expect(res.status).toBe(200)
-      expect(await res.json()).toEqual({
-        params: ['param1', 'param2'],
-      })
-    })
-
-    it('Should return responses from AnotherApp - sub + slash', async () => {
-      const res = await app.request('/another-app2/sub-slash')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('AnotherApp')
-    })
-
-    it('Should return responses from AnotherApp - with `basePath()`', async () => {
-      const res = await api.request('/api/another-app')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('AnotherApp')
-    })
-  })
-
-  describe('With encoded paths', () => {
-    const anotherApp = (req: Request) => new Response(getPath(req))
-
-    it('Should strip a decoded non-ASCII mount prefix', async () => {
-      const app = new Hono()
-      app.mount('/api/é', anotherApp)
-
-      const res = await app.request('/api/%C3%A9/hello')
-
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('/hello')
-    })
-
-    it('Should preserve an encoded slash as a literal path segment after stripping the prefix', async () => {
-      const app = new Hono()
-      app.mount('/api/v1', anotherApp)
-
-      const res = await app.request('/api/v1/admin%2Fsecret')
-
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('/admin%2Fsecret')
-    })
-
-    it('Should preserve encoded percent characters after stripping the prefix', async () => {
-      const app = new Hono()
-      app.mount('/api', anotherApp)
-
-      const res = await app.request('/api/foo%252Fbar')
-
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('/foo%252Fbar')
-    })
-  })
-
-  describe('With fetch', () => {
-    const anotherApp = async (req: Request, env: {}, executionContext: ExecutionContext) => {
-      const path = getPath(req)
-      if (path === '/') {
-        return new Response(
-          JSON.stringify({
-            env,
-            executionContext,
-          }),
-          {
-            headers: {
-              'Content-Type': 'application/json',
-            },
-          }
-        )
-      }
-      return new Response('Not Found from AnotherApp', {
-        status: 404,
-      })
-    }
-
-    const app = new Hono()
-    app.mount('/another-app', anotherApp)
-
-    it('Should handle Env and ExecuteContext', async () => {
-      const request = new Request('http://localhost/another-app')
-      const res = await app.fetch(
-        request,
-        {
-          TOKEN: 'foo',
-        },
-        {
-          // Force mocking!
-
-          // @ts-ignore
-          waitUntil: 'waitUntil',
-
-          // @ts-ignore
-          passThroughOnException: 'passThroughOnException',
-        }
-      )
-      expect(res.status).toBe(200)
-      expect(await res.json()).toEqual({
-        env: {
-          TOKEN: 'foo',
-        },
-        executionContext: {
-          waitUntil: 'waitUntil',
-          passThroughOnException: 'passThroughOnException',
-        },
-      })
-    })
-  })
-
-  describe('Mount on `/`', () => {
-    const anotherApp = (req: Request, params: unknown) => {
-      const path = getPath(req)
-      if (path === '/') {
-        return new Response('AnotherApp')
-      }
-      if (path === '/hello') {
-        return new Response('Hello from AnotherApp')
-      }
-      if (path === '/good/night') {
-        return new Response('Good Night from AnotherApp')
-      }
-      return new Response('Not Found from AnotherApp', {
-        status: 404,
-      })
-    }
-
-    const app = new Hono()
-    app.mount('/', anotherApp)
-
-    it('Should return responses from AnotherApp - mount on `/`', async () => {
-      let res = await app.request('/')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('AnotherApp')
-      res = await app.request('/hello')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('Hello from AnotherApp')
-      res = await app.request('/good/night')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('Good Night from AnotherApp')
-      res = await app.request('/not-found')
-      expect(res.status).toBe(404)
-      expect(await res.text()).toBe('Not Found from AnotherApp')
-    })
-  })
-
-  describe('With replaceRequest option', () => {
-    const anotherApp = (req: Request) => {
-      const path = getPath(req)
-      if (path === '/app') {
-        return new Response(getPath(req))
-      }
-      return new Response(null, { status: 404 })
-    }
-
-    const app = new Hono()
-    app.mount('/app', anotherApp, {
-      replaceRequest: (req) => req,
-    })
-
-    it('Should return 200 response with the correct path', async () => {
-      const res = await app.request('/app')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('/app')
-    })
-  })
-
-  describe('With replaceRequest: false', () => {
-    const anotherApp = (req: Request) => {
-      const path = getPath(req)
-      if (path === '/app') {
-        return new Response(getPath(req))
-      }
-      return new Response(null, { status: 404 })
-    }
-
-    const app = new Hono()
-    app.mount('/app', anotherApp, { replaceRequest: false })
-
-    it('Should return 200 response with the correct path', async () => {
-      const res = await app.request('/app')
-      expect(res.status).toBe(200)
-      expect(await res.text()).toBe('/app')
-    })
-  })
-})
-
 describe('HEAD method', () => {
   const app = new Hono()
 
@@ -2973,22 +3953,6 @@ describe('app.request()', () => {
     })
     expect(res.status).toBe(200)
     expect(await res.text()).toBe('"hello"')
-  })
-})
-
-describe('app.fire()', () => {
-  it('Should call global.addEventListener', () => {
-    const app = new Hono()
-    const addEventListener = vi.fn()
-    global.addEventListener = addEventListener
-    app.fire()
-    expect(addEventListener).toHaveBeenCalledWith('fetch', expect.any(Function))
-
-    const fetchEventListener = addEventListener.mock.calls[0][1]
-    const respondWith = vi.fn()
-    const request = new Request('http://localhost')
-    fetchEventListener({ respondWith, request })
-    expect(respondWith).toHaveBeenCalledWith(expect.any(Promise))
   })
 })
 
@@ -3797,8 +4761,8 @@ describe('app.basePath() with the internal #clone()', () => {
     .notFound((c) => {
       return c.text('Custom not found', 404)
     })
-    .onError((error, c) => {
-      return c.text(`Custom error "${error.message}"`, 500)
+    .onError((c) => {
+      return c.text(`Custom error "${c.error!.message}"`, 500)
     })
     .basePath('/api')
     .get('/test', async () => {
@@ -3829,5 +4793,27 @@ describe('Catch-all route with empty segment', () => {
     expect(res.status).toBe(200)
     const json = await res.json()
     expect(json).toEqual({ type: 'string', value: '' })
+  })
+})
+
+describe('Param pattern that matches an empty string', () => {
+  const app = new Hono()
+  app.get('/api/:id{[0-9]?}', (c) => c.text(`id=${c.req.param('id')}`))
+
+  it('Should match an empty segment', async () => {
+    const res = await app.request('/api/')
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe('id=')
+  })
+
+  it('Should match a non-empty segment', async () => {
+    const res = await app.request('/api/5')
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe('id=5')
+  })
+
+  it('Should not match a segment that does not satisfy the pattern', async () => {
+    const res = await app.request('/api/55')
+    expect(res.status).toBe(404)
   })
 })

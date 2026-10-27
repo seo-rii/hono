@@ -23,7 +23,7 @@ export const splitRoutingPath = (routePath: string): string[] => {
 const extractGroupsFromPath = (path: string): { groups: [string, string][]; path: string } => {
   const groups: [string, string][] = []
 
-  path = path.replace(/\{[^}]+\}/g, (match, index) => {
+  path = path.replace(/\{(?:\{[\d,]+\}|[^}])+\}/g, (match, index) => {
     const mark = `@${index}`
     groups.push([mark, match])
     return mark
@@ -133,24 +133,6 @@ export const getPath = (request: Request): string => {
   return url.slice(start, i)
 }
 
-/**
- * @deprecated
- * Use the `URL` API instead.
- */
-export const getQueryStrings = (url: string): string => {
-  const queryIndex = url.indexOf('?', 8)
-  if (queryIndex === -1) {
-    return ''
-  }
-
-  const hashIndex = url.indexOf('#', 8)
-  return hashIndex === -1
-    ? url.slice(queryIndex)
-    : queryIndex < hashIndex
-      ? url.slice(queryIndex, hashIndex)
-      : ''
-}
-
 export const getPathNoStrict = (request: Request): string => {
   const result = getPath(request)
 
@@ -244,8 +226,7 @@ const _getQueryParam = (
   if (!multiple && key && key.indexOf('%') === -1 && key.indexOf('+') === -1) {
     // optimized for unencoded key
 
-    const queryIndex = url.indexOf('?', 8)
-    let keyIndex = queryIndex
+    let keyIndex = url.indexOf('?', 8)
     if (keyIndex === -1) {
       return undefined
     }
@@ -254,19 +235,11 @@ const _getQueryParam = (
     }
     while (keyIndex !== -1) {
       const trailingKeyCode = url.charCodeAt(keyIndex + key.length + 1)
-      if (trailingKeyCode === 61 || trailingKeyCode === 38 || isNaN(trailingKeyCode)) {
-        // An earlier encoded key may decode to the same name.
-        if (
-          keyIndex > queryIndex &&
-          /(?:^|&)[^=&]*[%+]/.test(url.slice(queryIndex + 1, keyIndex))
-        ) {
-          break
-        }
-        if (trailingKeyCode === 61) {
-          const valueIndex = keyIndex + key.length + 2
-          const endIndex = url.indexOf('&', valueIndex)
-          return _decodeURI(url.slice(valueIndex, endIndex === -1 ? undefined : endIndex))
-        }
+      if (trailingKeyCode === 61) {
+        const valueIndex = keyIndex + key.length + 2
+        const endIndex = url.indexOf('&', valueIndex)
+        return _decodeURI(url.slice(valueIndex, endIndex === -1 ? undefined : endIndex))
+      } else if (trailingKeyCode == 38 || isNaN(trailingKeyCode)) {
         return ''
       }
       keyIndex = url.indexOf(`&${key}`, keyIndex + 1)

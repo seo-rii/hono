@@ -4,7 +4,7 @@
 import { HttpResponse, http } from 'msw'
 import { setupServer } from 'msw/node'
 import { expectTypeOf, vi } from 'vitest'
-import { upgradeWebSocket } from '../adapter/deno/websocket'
+import { defineWebSocketHelper } from '../helper/websocket'
 import { Hono } from '../hono'
 import { parse } from '../utils/cookie'
 import type { Equal, Expect, JSONValue, SimplifyDeepArray } from '../utils/types'
@@ -27,6 +27,8 @@ class SafeBigInt {
     }
   }
 }
+
+const upgradeWebSocket = defineWebSocketHelper(() => undefined)
 
 describe('Basic - JSON', () => {
   const app = new Hono()
@@ -2172,7 +2174,7 @@ describe('ApplyGlobalResponse Type Helper', () => {
     // Use explicit status code for proper type narrowing
     const app = new Hono().get('/api/users', (c) => c.json({ users: ['alice', 'bob'] }, 200))
 
-    // In real app: app.onError((err, c) => c.json({ error: err.message }, 500))
+    // In real app: app.onError((c) => c.json({ error: c.error!.message }, 500))
     type AppWithOnError = ApplyGlobalResponse<
       typeof app,
       {

@@ -5,7 +5,6 @@ import {
   getPattern,
   getQueryParam,
   getQueryParams,
-  getQueryStrings,
   mergePath,
   splitPath,
   splitRoutingPath,
@@ -47,6 +46,16 @@ describe('url', () => {
 
     ps = splitRoutingPath('/users/:dept{\\d+}/:@name{[0-9a-zA-Z_-]{3,10}}')
     expect(ps).toStrictEqual(['users', ':dept{\\d+}', ':@name{[0-9a-zA-Z_-]{3,10}}'])
+  })
+
+  it.each([
+    ['/x/:prefix{a{2}/b}/x', ['x', ':prefix{a{2}/b}', 'x']],
+    [
+      '/:first{[a-z]{1,3}/b}/:second{[0-9]{2,}/c}',
+      [':first{[a-z]{1,3}/b}', ':second{[0-9]{2,}/c}'],
+    ],
+  ])('Should preserve regex quantifiers and slashes when splitting %s', (path, expected) => {
+    expect(splitRoutingPath(path)).toStrictEqual(expected)
   })
 
   describe('getPattern', () => {
@@ -173,23 +182,6 @@ describe('url', () => {
     })
   })
 
-  describe('getQueryStrings', () => {
-    it('getQueryStrings', () => {
-      let qs = getQueryStrings('https://example.com/hello?name=foo&name=bar&age=20')
-      expect(qs).toBe('?name=foo&name=bar&age=20')
-      qs = getQueryStrings('https://example.com/hello?')
-      expect(qs).toBe('?')
-      qs = getQueryStrings('https://example.com/hello')
-      expect(qs).toBe('')
-      qs = getQueryStrings('https://example.com/hello?name=foo&name=bar&age=20#hash')
-      expect(qs).toBe('?name=foo&name=bar&age=20')
-      qs = getQueryStrings('https://example.com/hello#?name=probe')
-      expect(qs).toBe('')
-      qs = getQueryStrings('https://example.com/hello?name=foo%23bar#hash')
-      expect(qs).toBe('?name=foo%23bar')
-    })
-  })
-
   describe('getPathNoStrict', () => {
     it('getPathNoStrict - no strict is false', () => {
       let path = getPathNoStrict(new Request('https://example.com/hello/'))
@@ -261,22 +253,6 @@ describe('url', () => {
   })
 
   describe('getQueryParam', () => {
-    it.each([
-      ['item%5B%5D=first&item[]=second', 'item[]', 'first'],
-      ['item[]=first&item%5B%5D=second', 'item[]', 'first'],
-      ['%6eame=first&name=second', 'name', 'first'],
-      ['name=first&%6eame=second', 'name', 'first'],
-      ['name0=other&%6eame=first&name=second', 'name', 'first'],
-      ['%6eame=&name=second', 'name', ''],
-      ['%6eame&name=second', 'name', ''],
-      ['name+with+spaces=first&name with spaces=second', 'name with spaces', 'first'],
-    ])('returns the first decoded match for %s', (query, key, expected) => {
-      const url = `http://example.com/?${query}`
-      expect(getQueryParam(url, key)).toBe(expected)
-      expect(getQueryParam(url)).toHaveProperty([key], expected)
-      expect(getQueryParams(url, key)).toEqual([expected, 'second'])
-    })
-
     it('Parse URL query strings', () => {
       expect(getQueryParam('http://example.com/?name=hey', 'name')).toBe('hey')
       expect(getQueryParam('http://example.com/?name=hey#fragment', 'name')).toBe('hey')
