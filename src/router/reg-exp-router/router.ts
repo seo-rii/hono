@@ -129,6 +129,16 @@ export class RegExpRouter<T> implements Router<T> {
   match: typeof match<Router<T>, T> = match
 
   protected buildAllMatchers(): MatcherMap<T> {
+    // SmartRouter selects one router for every method. A newly accepted branch
+    // must not disable fallback for unsafe prefixes elsewhere in that router.
+    const tries = Object.values(this.#tries!)
+    if (tries.some((trie) => trie.usedDisjoint)) {
+      const unsafe = tries.find((trie) => trie.unsafePath !== undefined)
+      if (unsafe) {
+        throw new UnsupportedPathError(unsafe.unsafePath)
+      }
+    }
+
     const matchers: MatcherMap<T> = createNullObject()
 
     for (const method of Object.keys(this.#routes!)) {

@@ -5,13 +5,22 @@ import { Node } from './node'
 export type ReplacementMap = number[]
 
 export class Trie {
-  #context: Context = { varIndex: 0 }
+  #context: Context = { varIndex: 0, path: '' }
   #root: Node = new Node()
   #index: number = 0
   // dynamic path -> [handler index, param assoc]; static paths are not registered
   paths: Record<string, [number, ParamAssocArray]> = createNullObject()
 
+  get usedDisjoint(): boolean {
+    return this.#context.usedDisjoint ?? false
+  }
+
+  get unsafePath(): string | undefined {
+    return this.#context.unsafePath
+  }
+
   insert(path: string, isStatic: boolean): void {
+    this.#context.path = path
     if (isStatic) {
       // a static path has no pattern; every character is a literal token
       this.#root.insert(path.split(''), 0, [], this.#context, true)

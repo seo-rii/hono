@@ -8,6 +8,9 @@ export const PATH_ERROR = Symbol()
 export type ParamAssocArray = [string, number][]
 export interface Context {
   varIndex: number
+  path: string
+  usedDisjoint?: boolean
+  unsafePath?: string
 }
 
 const regExpMetaChars = new Set('.\\+*[^]$()')
@@ -102,6 +105,7 @@ export class Node {
   // handler index of a dynamic path, or -1 for a static path terminal
   #index?: number
   #varIndex?: number
+  #hasLiteral?: boolean
   #children: Record<string, Node> = createNullObject()
 
   insert(
@@ -128,6 +132,10 @@ export class Node {
 
       let nextNode: Node
       if (pattern) {
+        if (token === '*' && i < len - 1) {
+          // Middle wildcards have different empty-segment semantics in TrieRouter.
+          context.unsafePath ??= context.path
+        }
         const name = pattern[1]
         let regexpStr = pattern[2] || LABEL_REG_EXP_STR
         if (name && pattern[2]) {
@@ -143,6 +151,15 @@ export class Node {
             // a single-char pattern like :x{.} is ambiguous with a literal character
             throw PATH_ERROR
           }
+          if (regexpStr !== LABEL_REG_EXP_STR) {
+            const ranges = firstCharacterRanges(regexpStr)
+            if (!ranges || ranges.some(([start, end]) => start <= 47 && 47 <= end)) {
+              // Keep newly accepted tables within the proven nonempty segment grammar.
+              // Slash-consuming prefixes can backtrack into another branch, and empty
+              // terminal captures can be mistaken for the handler marker.
+              context.unsafePath ??= context.path
+            }
+          }
         }
 
         nextNode = node.#children[regexpStr]
@@ -153,16 +170,23 @@ export class Node {
                 // a single-char pattern coexists with single-char literals as a literal does
                 (regexpStr.length > 1 || k.length > 1) &&
                 k !== ONLY_WILDCARD_REG_EXP_STR &&
-                k !== TAIL_WILDCARD_REG_EXP_STR &&
-                !areDisjoint(regexpStr, k)
+                k !== TAIL_WILDCARD_REG_EXP_STR
               ) {
-                throw PATH_ERROR
+                if (!areDisjoint(regexpStr, k)) {
+                  throw PATH_ERROR
+                }
+                context.usedDisjoint = true
               }
             }
           }
           nextNode = node.#children[regexpStr] = new Node()
         }
         if (name !== '') {
+          if (nextNode.#hasLiteral) {
+            // Middleware propagation compares route spellings, so a parameter
+            // and an equivalent literal cannot safely share a new disjoint table.
+            context.unsafePath ??= context.path
+          }
           nextNode.#varIndex ??= context.varIndex++
           paramMap.push([name, nextNode.#varIndex])
         }
@@ -173,14 +197,22 @@ export class Node {
             if (
               k.length > 1 &&
               k !== ONLY_WILDCARD_REG_EXP_STR &&
-              k !== TAIL_WILDCARD_REG_EXP_STR &&
-              !areDisjoint(token, k)
+              k !== TAIL_WILDCARD_REG_EXP_STR
             ) {
-              throw PATH_ERROR
+              if (!areDisjoint(token, k)) {
+                throw PATH_ERROR
+              }
+              context.usedDisjoint = true
             }
           }
           nextNode = node.#children[token] = new Node()
         }
+        if (nextNode.#varIndex !== undefined || token.length !== 1 || '{}|?@#'.includes(token)) {
+          // These literal characters are not escaped by the regexp emitter, or
+          // are reserved by its capture-marker replacement pass.
+          context.unsafePath ??= context.path
+        }
+        nextNode.#hasLiteral = true
       }
 
       node = nextNode
