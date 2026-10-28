@@ -5,29 +5,47 @@ import { Node } from './node'
 
 export type ReplacementMap = number[]
 
+const lookaheadMetaChars = /[\\^$*+?()[\]{}|]/
+
+function isEscapedPunctuation(character: string): boolean {
+  const code = character.charCodeAt(0)
+  return code >= 32 && code <= 126 && !/[A-Za-z0-9]/.test(character)
+}
+
 function hasCompatibleLookahead(next: string): boolean {
-  let inClass = false
-  for (let i = 0; i < next.length; i++) {
-    const character = next[i]
+  const repeat = next[next.length - 1]
+  const atom = repeat === '*' || repeat === '+' ? next.slice(0, -1) : next
+  // Literal atoms match their own text (including a literal dot). A final
+  // repetition can use that known prefix; a bare '+' repeats the preceding '/'.
+  if (!lookaheadMetaChars.test(atom)) {
+    return true
+  }
+  if (repeat !== '*') {
+    return false
+  }
+  // These whole atoms can repeat zero times. Validate only a small grammar,
+  // never execute a regexp made from literal route text during preparation.
+  if (atom[0] === '(' && atom[atom.length - 1] === ')') {
+    return !lookaheadMetaChars.test(atom.slice(1, -1))
+  }
+  if (atom.length === 2 && atom[0] === '\\') {
+    return isEscapedPunctuation(atom[1])
+  }
+  if (atom[0] !== '[' || atom[atom.length - 1] !== ']') {
+    return false
+  }
+  const end = atom.length - 1
+  for (let i = atom[1] === '^' ? 2 : 1; i < end; i++) {
+    const character = atom[i]
     if (character === '\\') {
-      i++
-    } else if (character === '[') {
-      inClass = true
-    } else if (character === ']') {
-      inClass = false
-    } else if (character === '$' && !inClass) {
-      // A successful probe at EOF cannot prove compatibility for longer paths.
+      if (++i === end || !isEscapedPunctuation(atom[i])) {
+        return false
+      }
+    } else if (character === '[' || character === ']' || character === '-') {
       return false
     }
   }
-  const prefix = next.indexOf('*') === next.length - 1 ? next.slice(0, -1) : next
-  try {
-    // TrieRouter embeds the next segment unescaped in a lookahead. Probe after
-    // a nonempty capture, using the shortest segment a prefixed wildcard accepts.
-    return new RegExp('^_(?=/' + next + ')').test('_/' + prefix)
-  } catch {
-    return false
-  }
+  return true
 }
 
 export class Trie {
