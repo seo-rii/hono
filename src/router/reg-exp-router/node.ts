@@ -35,7 +35,9 @@ function firstCharacterRanges(pattern: string): [number, number][] | undefined {
   }
 
   const characters = match[1]
-  const ranges: [number, number][] = []
+  // ASCII membership bounds the proof size even when a class repeats members
+  // or overlapping ranges many times.
+  const members = new Uint8Array(128)
   for (let i = 0; i < characters.length; i++) {
     const start = characters.charCodeAt(i)
     if (characters[i] === '-') {
@@ -47,11 +49,22 @@ function firstCharacterRanges(pattern: string): [number, number][] | undefined {
       if (characters[i + 2] === '-' || end < start) {
         return
       }
-      ranges.push([start, end])
+      members.fill(1, start, end + 1)
       i += 2
       continue
     }
-    ranges.push([start, start])
+    members[start] = 1
+  }
+  const ranges: [number, number][] = []
+  for (let start = 0; start < members.length; start++) {
+    if (members[start]) {
+      let end = start
+      while (members[end + 1]) {
+        end++
+      }
+      ranges.push([start, end])
+      start = end
+    }
   }
   return ranges
 }
