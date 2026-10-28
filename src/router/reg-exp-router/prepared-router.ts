@@ -154,13 +154,35 @@ export const buildInitParams: (params: {
   return [matchers, relocateMap]
 }
 
+function serializeInitValue(value: unknown): string {
+  if (value instanceof RegExp) {
+    return value.toString()
+  }
+  if (value === undefined) {
+    return 'undefined'
+  }
+  if (Array.isArray(value)) {
+    return `[${Array.from(value, serializeInitValue).join(',')}]`
+  }
+  if (value !== null && typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== null && prototype !== Object.prototype) {
+      throw new Error('Unsupported prepared initializer value')
+    }
+    return `{${Object.entries(value)
+      .map(([key, item]) => {
+        const name = JSON.stringify(key)
+        return `${key === '__proto__' ? `[${name}]` : name}:${serializeInitValue(item)}`
+      })
+      .join(',')}}`
+  }
+  const literal = JSON.stringify(value)
+  if (literal === undefined) {
+    throw new Error('Unsupported prepared initializer value')
+  }
+  return literal
+}
+
 export const serializeInitParams: (
   params: ConstructorParameters<typeof PreparedRegExpRouter>
-) => string = ([matchers, relocateMap]) => {
-  // Embed regular expressions and undefined captures as JavaScript, which JSON cannot express.
-  const matchersStr = JSON.stringify(matchers, (_, value) =>
-    value instanceof RegExp || value === undefined ? `##${value}##` : value
-  ).replace(/"##(.+?)##"/g, (_, str) => str.replace(/\\\\/g, '\\'))
-  const relocateMapStr = JSON.stringify(relocateMap)
-  return `[${matchersStr},${relocateMapStr}]`
-}
+) => string = (params) => serializeInitValue(params)
