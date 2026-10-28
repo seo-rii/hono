@@ -62,6 +62,10 @@ export class RegExpRouter<T> implements Router<T> {
     if (!handlers) {
       throw new Error(MESSAGE_MATCHER_IS_ALREADY_BUILT)
     }
+    if (!Object.hasOwn(handlers, method) && method in handlers) {
+      // Inherited method names are unsupported; let SmartRouter try TrieRouter.
+      throw new UnsupportedPathError(path)
+    }
 
     const tries = this.#tries!
     if (!handlers[method]) {
