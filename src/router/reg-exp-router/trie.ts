@@ -1,8 +1,34 @@
+import { splitRoutingPath } from '../../utils/url'
 import { createNullObject } from '../utils'
 import type { Context, ParamAssocArray } from './node'
 import { Node } from './node'
 
 export type ReplacementMap = number[]
+
+function hasCompatibleLookahead(next: string): boolean {
+  let inClass = false
+  for (let i = 0; i < next.length; i++) {
+    const character = next[i]
+    if (character === '\\') {
+      i++
+    } else if (character === '[') {
+      inClass = true
+    } else if (character === ']') {
+      inClass = false
+    } else if (character === '$' && !inClass) {
+      // A successful probe at EOF cannot prove compatibility for longer paths.
+      return false
+    }
+  }
+  const prefix = next.indexOf('*') === next.length - 1 ? next.slice(0, -1) : next
+  try {
+    // TrieRouter embeds the next segment unescaped in a lookahead. Probe after
+    // a nonempty capture, using the shortest segment a prefixed wildcard accepts.
+    return new RegExp('^_(?=/' + next + ')').test('_/' + prefix)
+  } catch {
+    return false
+  }
+}
 
 export class Trie {
   #context: Context = { varIndex: 0, path: '' }
@@ -27,6 +53,20 @@ export class Trie {
       this.#root.insert(path.split(''), -1, [], this.#context, keys)
       this.paths[path] = [-1, [], keys]
       return
+    }
+
+    const parts = splitRoutingPath(path)
+    for (let i = 0; i < parts.length - 1; i++) {
+      const next = parts[i + 1]
+      if (
+        /^:[^{}]+\{.+\}$/.test(parts[i]) &&
+        next &&
+        next[0] !== ':' &&
+        next[0] !== '*' &&
+        !hasCompatibleLookahead(next)
+      ) {
+        this.#context.unsafePath ??= path
+      }
     }
 
     const paramAssoc: ParamAssocArray = []
