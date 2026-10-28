@@ -156,7 +156,15 @@ export const buildInitParams: (params: {
 
 function serializeInitValue(value: unknown): string {
   if (value instanceof RegExp) {
-    return value.toString()
+    // Lone surrogate units cannot survive UTF-8 source encoding.
+    const unicode = /[uv]/.test(value.flags)
+    return value.toString().replace(/(\\*)[\uD800-\uDFFF]/gu, (part, slashes: string) => {
+      const code = part.charCodeAt(part.length - 1).toString(16)
+      const prefix = slashes.length % 2 ? slashes : slashes + '\\'
+      // Reuse a legacy identity escape, and keep Unicode surrogate atoms
+      // separate from adjacent escapes that could otherwise form a pair.
+      return prefix + (unicode ? 'u{' + code + '}' : 'u' + code)
+    })
   }
   if (value === undefined) {
     return 'undefined'

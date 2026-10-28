@@ -7,7 +7,9 @@ type InitParams = ConstructorParameters<typeof PreparedRegExpRouter>
 type HonoHandler = Parameters<Hono['router']['add']>[2]
 
 async function loadInitializer(source: string): Promise<() => InitParams> {
-  const url = 'data:text/javascript,' + encodeURIComponent('export default () => ' + source)
+  const bytes = new TextEncoder().encode('export default () => ' + source)
+  const base64 = btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''))
+  const url = 'data:text/javascript;base64,' + base64
   const module = await import(/* @vite-ignore */ url)
   return module.default
 }
@@ -24,6 +26,94 @@ function normalize<T>(result: Result<T>) {
 }
 
 describe('serialized PreparedRegExpRouter initializers', () => {
+  it.each([
+    ['literal', '[\uD800-\uDBFF][\uDC00-\uDFFF]'],
+    [
+      'identity-escaped',
+      '[\\' + '\uD800' + '-\\' + '\uDBFF' + '][\\' + '\uDC00' + '-\\' + '\uDFFF' + ']',
+    ],
+  ])('preserves %s surrogate ranges after UTF-8 materialization', async (_name, pattern) => {
+    const route = '/a/:x{' + pattern + '}'
+    const paths = [route]
+    const direct = buildInitParams({ paths }) as ConstructorParameters<
+      typeof PreparedRegExpRouter<HonoHandler>
+    >
+    const create = await loadInitializer(serializeInitParams(buildInitParams({ paths })))
+    const loaded = create() as ConstructorParameters<typeof PreparedRegExpRouter<HonoHandler>>
+    const apps = [
+      new Hono({ router: new TrieRouter() }),
+      new Hono({ router: new PreparedRegExpRouter(...direct) }),
+      new Hono({ router: new PreparedRegExpRouter(...loaded) }),
+    ]
+    for (const app of apps) {
+      app.get(route, (c) => c.json(c.req.param()))
+    }
+    for (const [value, status] of [
+      ['%F0%9F%98%80', 200],
+      ['%F0%90%80%80', 200],
+      ['%F4%8F%BF%BF', 200],
+      ['%EF%BF%BD%EF%BF%BD', 404],
+      ['00', 404],
+      ['uu', 404],
+    ] as const) {
+      for (const app of apps) {
+        const response = await app.request('/a/' + value)
+        expect(response.status).toBe(status)
+        if (status === 200) {
+          expect(await response.json()).toEqual({ x: decodeURIComponent(value) })
+        }
+      }
+    }
+  })
+
+  it.each(['', 'u', 'v'])(
+    'preserves lone surrogates and valid pairs with regexp flags %s',
+    async (flags) => {
+      const params = buildInitParams({ paths: ['/a/:x'] })
+      const regexp = new RegExp('^(?:\uD800|\uDC00|\uD83D\uDE00)$', flags)
+      params[0].ALL![0] = regexp
+      const create = await loadInitializer(serializeInitParams(params))
+      const copy = create()[0].ALL![0]
+      expect(copy.flags).toBe(flags)
+      for (const value of ['\uD800', '\uDC00', '\uD83D\uDE00', '\uFFFD', '\uFFFD\uFFFD', 'a']) {
+        expect(copy.test(value), JSON.stringify(value)).toBe(regexp.test(value))
+      }
+    }
+  )
+
+  it.each([0, 1, 2, 3, 4])('preserves %i backslashes before a lone surrogate', async (count) => {
+    const params = buildInitParams({ paths: ['/a/:x'] })
+    const regexp = new RegExp('^' + '\\'.repeat(count) + '\uD800' + '$')
+    params[0].ALL![0] = regexp
+    const create = await loadInitializer(serializeInitParams(params))
+    const copy = create()[0].ALL![0]
+    for (const prefix of ['', '\\', '\\\\', '\\\\\\']) {
+      for (const suffix of ['\uD800', 'ud800', '\\ud800']) {
+        const value = prefix + suffix
+        expect(copy.test(value), JSON.stringify({ count, value })).toBe(regexp.test(value))
+      }
+    }
+  })
+
+  it.each(['u', 'v'])('keeps raw and escaped surrogate atoms separate with %s', async (flags) => {
+    for (const pattern of [
+      '\uD800' + '\\uDC00',
+      '\\uD800' + '\uDC00',
+      '[' + '\uD800' + '\\uDC00' + ']',
+      '[' + '\\uD800' + '\uDC00' + ']',
+    ]) {
+      const params = buildInitParams({ paths: ['/a/:x'] })
+      const regexp = new RegExp('^(?:' + pattern + ')$', flags)
+      params[0].ALL![0] = regexp
+      const create = await loadInitializer(serializeInitParams(params))
+      const copy = create()[0].ALL![0]
+      expect(copy.flags).toBe(flags)
+      for (const value of ['\uD800', '\uDC00', '\uD800\uDC00', '\uD83D\uDE00', '\uFFFD', 'a']) {
+        expect(copy.test(value), JSON.stringify({ flags, pattern, value })).toBe(regexp.test(value))
+      }
+    }
+  })
+
   it('preserves escaped quotes when loading the initializer as ESM', async () => {
     const route = String.raw`/a/:x{\"}`
     const create = await loadInitializer(serializeInitParams(buildInitParams({ paths: [route] })))
