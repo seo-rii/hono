@@ -213,9 +213,9 @@ export class Node {
           }
           nextNode = node.#children[token] = new Node()
         }
-        if (token.length !== 1 || '{}|?@#'.includes(token)) {
-          // Do not expose existing emitter/marker ambiguities by accepting an
-          // otherwise unsupported table solely through the new sibling proof.
+        if (token.length !== 1 || '{}|?@#*'.includes(token)) {
+          // Keep emitter/marker ambiguities behind fallback. Literal stars can also
+          // form segments such as `a**` that TrieRouter treats entirely literally.
           context.unsafePath ??= context.path
         }
       }
