@@ -135,6 +135,10 @@ export class Node {
       let nextNode: Node
       if (pattern) {
         const name = pattern[1]
+        if (name && i > 0 && tokens[i - 1] !== '/') {
+          // TrieRouter treats a colon inside a literal segment literally.
+          context.unsafePath ??= context.path
+        }
         let regexpStr = pattern[2] || LABEL_REG_EXP_STR
         if (name && pattern[2]) {
           if (new RegExp(regexpStr).test('')) {
