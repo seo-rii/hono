@@ -10,9 +10,77 @@ export const PATH_ERROR = Symbol()
 export type ParamAssocArray = [string, number][]
 export interface Context {
   varIndex: number
+  path: string
+  usedDisjoint?: boolean
+  hasDisjointRoutes?: boolean
+  unsafePath?: string
 }
 
 const regExpMetaChars = new Set('.\\+*[^]$()')
+
+// Prove disjointness only for whole, nonempty atoms. Unknown expressions keep
+// their existing fallback behavior rather than relying on a regexp prefix.
+function firstCharacterRanges(pattern: string): [number, number][] | undefined {
+  if (pattern.length === 1 && /^[A-Za-z0-9_/-]$/.test(pattern)) {
+    const code = pattern.charCodeAt(0)
+    return [[code, code]]
+  }
+
+  const atom = pattern.endsWith('+') ? pattern.slice(0, -1) : pattern
+  if (atom === '\\d') {
+    return [[48, 57]]
+  }
+  const match = /^\[([A-Za-z0-9_-]+)\]$/.exec(atom)
+  if (!match || match[0].length !== atom.length) {
+    return
+  }
+
+  const characters = match[1]
+  // ASCII membership bounds the proof size even when a class repeats members
+  // or overlapping ranges many times.
+  const members = new Uint8Array(128)
+  for (let i = 0; i < characters.length; i++) {
+    const start = characters.charCodeAt(i)
+    if (characters[i] === '-') {
+      if (i !== 0 && i !== characters.length - 1) {
+        return
+      }
+    } else if (characters[i + 1] === '-' && i + 2 < characters.length) {
+      const end = characters.charCodeAt(i + 2)
+      if (characters[i + 2] === '-' || end < start) {
+        return
+      }
+      members.fill(1, start, end + 1)
+      i += 2
+      continue
+    }
+    members[start] = 1
+  }
+  const ranges: [number, number][] = []
+  for (let start = 0; start < members.length; start++) {
+    if (members[start]) {
+      let end = start
+      while (members[end + 1]) {
+        end++
+      }
+      ranges.push([start, end])
+      start = end
+    }
+  }
+  return ranges
+}
+
+function areDisjoint(a: string, b: string): boolean {
+  const left = firstCharacterRanges(a)
+  const right = firstCharacterRanges(b)
+  return (
+    !!left &&
+    !!right &&
+    left.every(([leftStart, leftEnd]) =>
+      right.every(([rightStart, rightEnd]) => leftEnd < rightStart || rightEnd < leftStart)
+    )
+  )
+}
 
 /**
  * Sort order:
@@ -81,13 +149,40 @@ export class Node {
       let nextNode: Node
       if (pattern) {
         const name = pattern[1]
+        const isEmbeddedParameter = !!name && i > 0 && tokens[i - 1] !== '/'
+        if (isEmbeddedParameter) {
+          // TrieRouter treats a colon inside a literal segment literally.
+          context.unsafePath ??= context.path
+        }
         let regexpStr = pattern[2] || LABEL_REG_EXP_STR
         if (name && pattern[2]) {
-          if (new RegExp(regexpStr).test('')) {
+          let regexp: RegExp
+          try {
+            regexp = new RegExp(regexpStr)
+          } catch (error) {
+            if (isEmbeddedParameter && error instanceof SyntaxError) {
+              // Invalid regexp-looking literal text also needs TrieRouter fallback.
+              throw PATH_ERROR
+            }
+            throw error
+          }
+          const normalizedRegexpStr = regexpStr.replace(/^\((?!\?:)(?=[^)]+\)$)/, '(?:')
+          const ranges =
+            normalizedRegexpStr === LABEL_REG_EXP_STR
+              ? undefined
+              : firstCharacterRanges(normalizedRegexpStr)
+          const isUnsafePattern =
+            normalizedRegexpStr !== LABEL_REG_EXP_STR &&
+            (!ranges || ranges.some(([start, end]) => start <= 47 && 47 <= end))
+          if (isUnsafePattern && (context.usedDisjoint || context.hasDisjointRoutes)) {
+            // Reject newly supported tables before executing unknown constraints.
+            throw PATH_ERROR
+          }
+          if (regexp.test('')) {
             // an empty capture is indistinguishable from the handler marker `$()` at match time
             throw PATH_ERROR
           }
-          regexpStr = regexpStr.replace(/^\((?!\?:)(?=[^)]+\)$)/, '(?:') // (a|b) => (?:a|b)
+          regexpStr = normalizedRegexpStr // (a|b) => (?:a|b)
           if (/\((?!\?:)/.test(regexpStr)) {
             // prefix(?:a|b) is allowed, but prefix(a|b) is not
             throw PATH_ERROR
@@ -95,6 +190,9 @@ export class Node {
           if (regexpStr.length === 1 && regExpMetaChars.has(regexpStr)) {
             // a single-char pattern like :x{.} is ambiguous with a literal character
             throw PATH_ERROR
+          }
+          if (isUnsafePattern) {
+            context.unsafePath ??= context.path
           }
         }
 
@@ -115,13 +213,21 @@ export class Node {
                 // cannot be represented together
                 (k !== TAIL_WILDCARD_REG_EXP_STR || regexpStr === PREFIXED_WILDCARD_REG_EXP_STR)
               ) {
-                throw PATH_ERROR
+                if (!areDisjoint(regexpStr, k)) {
+                  throw PATH_ERROR
+                }
+                context.usedDisjoint = true
               }
             }
           }
           nextNode = node.#children[regexpStr] = new Node()
         }
         if (name !== '') {
+          if (paramMap.some(([key]) => key === name)) {
+            // RegExpRouter and TrieRouter resolve repeated names differently.
+            // Preserve fallback when the new sibling proof is used.
+            context.unsafePath ??= context.path
+          }
           nextNode.#varIndex ??= context.varIndex++
           paramMap.push([name, nextNode.#varIndex])
         }
@@ -135,10 +241,18 @@ export class Node {
               k !== ONLY_WILDCARD_REG_EXP_STR &&
               k !== TAIL_WILDCARD_REG_EXP_STR
             ) {
-              throw PATH_ERROR
+              if (!areDisjoint(token, k)) {
+                throw PATH_ERROR
+              }
+              context.usedDisjoint = true
             }
           }
           nextNode = node.#children[token] = new Node()
+        }
+        if (token.length !== 1 || '{}|?@#*'.includes(token)) {
+          // Keep emitter/marker ambiguities behind fallback. Literal stars can also
+          // form segments such as `a**` that TrieRouter treats entirely literally.
+          context.unsafePath ??= context.path
         }
       }
 

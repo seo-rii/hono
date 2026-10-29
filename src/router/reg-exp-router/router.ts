@@ -43,6 +43,7 @@ export class RegExpRouter<T> implements Router<T> {
   // method -> handlers in registration order; a method starts with a copy of ALL's
   #handlers?: Record<string, HandlerWithMetadata<T>[]>
   #tries?: Record<string, Trie>
+  #usedDisjoint = false
 
   constructor() {
     this.#handlers = { [METHOD_NAME_ALL]: [] }
@@ -50,10 +51,14 @@ export class RegExpRouter<T> implements Router<T> {
   }
 
   #insertPath(method: string, path: string) {
+    const trie = this.#tries![method]
     try {
-      this.#tries![method].insert(path, !/\*|\/:/.test(path))
+      trie.insert(path, !/\*|\/:/.test(path), this.#usedDisjoint)
     } catch (e) {
       throw e === PATH_ERROR ? new UnsupportedPathError(path) : e
+    } finally {
+      // Other methods must see proofs made before even a partial insertion failed.
+      this.#usedDisjoint ||= trie.usedDisjoint
     }
   }
 
@@ -61,6 +66,10 @@ export class RegExpRouter<T> implements Router<T> {
     const handlers = this.#handlers
     if (!handlers) {
       throw new Error(MESSAGE_MATCHER_IS_ALREADY_BUILT)
+    }
+    if (!Object.hasOwn(handlers, method) && method in handlers) {
+      // Inherited method names are unsupported; let SmartRouter try TrieRouter.
+      throw new UnsupportedPathError(path)
     }
 
     const tries = this.#tries!
@@ -90,10 +99,30 @@ export class RegExpRouter<T> implements Router<T> {
   match: typeof match<Router<T>, T> = match
 
   protected buildAllMatchers(): MatcherMap<T> {
+    // SmartRouter chooses one implementation for every method, so a newly
+    // accepted branch must not bypass fallback for an unsafe route elsewhere.
+    const tries = Object.values(this.#tries!)
+    const usedDisjoint = tries.some((trie) => trie.usedDisjoint)
+    if (usedDisjoint) {
+      const unsafe = tries.find((trie) => trie.unsafePath !== undefined)
+      if (unsafe) {
+        throw new UnsupportedPathError(unsafe.unsafePath)
+      }
+    }
+
     const matchers: MatcherMap<T> = createNullObject()
 
-    for (const method of Object.keys(this.#handlers!)) {
-      matchers[method] = this.#buildMatcher(method)
+    try {
+      for (const method of Object.keys(this.#handlers!)) {
+        matchers[method] = this.#buildMatcher(method)
+      }
+    } catch (e) {
+      if (usedDisjoint && e instanceof RangeError) {
+        // New router selection must preserve TrieRouter fallback when matcher
+        // compilation exceeds the engine's stack or other capacity limits.
+        throw new UnsupportedPathError(e.message)
+      }
+      throw e
     }
 
     // Release cache
