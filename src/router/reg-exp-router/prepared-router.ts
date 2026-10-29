@@ -158,9 +158,15 @@ function serializeInitValue(value: unknown): string {
   if (value instanceof RegExp) {
     // Lone surrogate units cannot survive UTF-8 source encoding.
     const unicode = /[uv]/.test(value.flags)
-    return value.toString().replace(/(\\*)[\uD800-\uDFFF]/gu, (part, slashes: string) => {
-      const code = part.charCodeAt(part.length - 1).toString(16)
-      const prefix = slashes.length % 2 ? slashes : slashes + '\\'
+    const source = value.toString()
+    return source.replace(/[\uD800-\uDFFF]/gu, (part, offset: number) => {
+      // Each preceding backslash run is visited only for its own surrogate.
+      let start = offset
+      while (start > 0 && source[start - 1] === '\\') {
+        start--
+      }
+      const code = part.charCodeAt(0).toString(16)
+      const prefix = (offset - start) % 2 ? '' : '\\'
       // Reuse a legacy identity escape, and keep Unicode surrogate atoms
       // separate from adjacent escapes that could otherwise form a pair.
       return prefix + (unicode ? 'u{' + code + '}' : 'u' + code)
