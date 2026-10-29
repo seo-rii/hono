@@ -97,7 +97,8 @@ export class RegExpRouter<T> implements Router<T> {
     // SmartRouter chooses one implementation for every method, so a newly
     // accepted branch must not bypass fallback for an unsafe route elsewhere.
     const tries = Object.values(this.#tries!)
-    if (tries.some((trie) => trie.usedDisjoint)) {
+    const usedDisjoint = tries.some((trie) => trie.usedDisjoint)
+    if (usedDisjoint) {
       const unsafe = tries.find((trie) => trie.unsafePath !== undefined)
       if (unsafe) {
         throw new UnsupportedPathError(unsafe.unsafePath)
@@ -106,8 +107,17 @@ export class RegExpRouter<T> implements Router<T> {
 
     const matchers: MatcherMap<T> = createNullObject()
 
-    for (const method of Object.keys(this.#handlers!)) {
-      matchers[method] = this.#buildMatcher(method)
+    try {
+      for (const method of Object.keys(this.#handlers!)) {
+        matchers[method] = this.#buildMatcher(method)
+      }
+    } catch (e) {
+      if (usedDisjoint && e instanceof RangeError) {
+        // New router selection must preserve TrieRouter fallback when matcher
+        // compilation exceeds the engine's stack or other capacity limits.
+        throw new UnsupportedPathError(e.message)
+      }
+      throw e
     }
 
     // Release cache
