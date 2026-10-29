@@ -63,8 +63,9 @@ export class Trie {
     return this.#context.unsafePath
   }
 
-  insert(path: string, isStatic: boolean): void {
+  insert(path: string, isStatic: boolean, hasDisjointRoutes = false): void {
     this.#context.path = path
+    this.#context.hasDisjointRoutes = hasDisjointRoutes
     const keys: string[] = []
     if (isStatic) {
       // a static path has no pattern; every character is a literal token

@@ -12,6 +12,7 @@ export interface Context {
   varIndex: number
   path: string
   usedDisjoint?: boolean
+  hasDisjointRoutes?: boolean
   unsafePath?: string
 }
 
@@ -165,11 +166,23 @@ export class Node {
             }
             throw error
           }
+          const normalizedRegexpStr = regexpStr.replace(/^\((?!\?:)(?=[^)]+\)$)/, '(?:')
+          const ranges =
+            normalizedRegexpStr === LABEL_REG_EXP_STR
+              ? undefined
+              : firstCharacterRanges(normalizedRegexpStr)
+          const isUnsafePattern =
+            normalizedRegexpStr !== LABEL_REG_EXP_STR &&
+            (!ranges || ranges.some(([start, end]) => start <= 47 && 47 <= end))
+          if (isUnsafePattern && (context.usedDisjoint || context.hasDisjointRoutes)) {
+            // Reject newly supported tables before executing unknown constraints.
+            throw PATH_ERROR
+          }
           if (regexp.test('')) {
             // an empty capture is indistinguishable from the handler marker `$()` at match time
             throw PATH_ERROR
           }
-          regexpStr = regexpStr.replace(/^\((?!\?:)(?=[^)]+\)$)/, '(?:') // (a|b) => (?:a|b)
+          regexpStr = normalizedRegexpStr // (a|b) => (?:a|b)
           if (/\((?!\?:)/.test(regexpStr)) {
             // prefix(?:a|b) is allowed, but prefix(a|b) is not
             throw PATH_ERROR
@@ -178,13 +191,8 @@ export class Node {
             // a single-char pattern like :x{.} is ambiguous with a literal character
             throw PATH_ERROR
           }
-          if (regexpStr !== LABEL_REG_EXP_STR) {
-            const ranges = firstCharacterRanges(regexpStr)
-            if (!ranges || ranges.some(([start, end]) => start <= 47 && 47 <= end)) {
-              // New sibling branches need unambiguous segment boundaries. A
-              // slash-consuming ancestor can backtrack into another branch.
-              context.unsafePath ??= context.path
-            }
+          if (isUnsafePattern) {
+            context.unsafePath ??= context.path
           }
         }
 

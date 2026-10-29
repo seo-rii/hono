@@ -43,6 +43,7 @@ export class RegExpRouter<T> implements Router<T> {
   // method -> handlers in registration order; a method starts with a copy of ALL's
   #handlers?: Record<string, HandlerWithMetadata<T>[]>
   #tries?: Record<string, Trie>
+  #usedDisjoint = false
 
   constructor() {
     this.#handlers = { [METHOD_NAME_ALL]: [] }
@@ -50,10 +51,14 @@ export class RegExpRouter<T> implements Router<T> {
   }
 
   #insertPath(method: string, path: string) {
+    const trie = this.#tries![method]
     try {
-      this.#tries![method].insert(path, !/\*|\/:/.test(path))
+      trie.insert(path, !/\*|\/:/.test(path), this.#usedDisjoint)
     } catch (e) {
       throw e === PATH_ERROR ? new UnsupportedPathError(path) : e
+    } finally {
+      // Other methods must see proofs made before even a partial insertion failed.
+      this.#usedDisjoint ||= trie.usedDisjoint
     }
   }
 
