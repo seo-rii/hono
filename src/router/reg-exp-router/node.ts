@@ -148,13 +148,24 @@ export class Node {
       let nextNode: Node
       if (pattern) {
         const name = pattern[1]
-        if (name && i > 0 && tokens[i - 1] !== '/') {
+        const isEmbeddedParameter = !!name && i > 0 && tokens[i - 1] !== '/'
+        if (isEmbeddedParameter) {
           // TrieRouter treats a colon inside a literal segment literally.
           context.unsafePath ??= context.path
         }
         let regexpStr = pattern[2] || LABEL_REG_EXP_STR
         if (name && pattern[2]) {
-          if (new RegExp(regexpStr).test('')) {
+          let regexp: RegExp
+          try {
+            regexp = new RegExp(regexpStr)
+          } catch (error) {
+            if (isEmbeddedParameter && error instanceof SyntaxError) {
+              // Invalid regexp-looking literal text also needs TrieRouter fallback.
+              throw PATH_ERROR
+            }
+            throw error
+          }
+          if (regexp.test('')) {
             // an empty capture is indistinguishable from the handler marker `$()` at match time
             throw PATH_ERROR
           }
